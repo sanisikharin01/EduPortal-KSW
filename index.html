@@ -456,6 +456,77 @@
       return a === b || a.replace(/^0+/, '') === b.replace(/^0+/, '');
     };
 
+    // Helper: Parse AllowedCourses string into clean array
+    const parseAllowedCoursesList = (allowedStr) => {
+      const raw = String(allowedStr || '').trim();
+      if (!raw || raw.toUpperCase() === 'NONE') return [];
+      if (raw === '*') return ['*'];
+      return raw.split(',').map(s => s.trim()).filter(Boolean);
+    };
+
+    // Helper: Check if a student has permission to access a specific course
+    const isStudentEnrolledInCourse = (student, course) => {
+      if (!student || !course) return false;
+      const list = parseAllowedCoursesList(student.AllowedCourses);
+      if (list.includes('*')) return true;
+      const upperList = list.map(s => s.toUpperCase());
+      const cId = String(course.CourseID || '').trim().toUpperCase();
+      const cCode = String(course.Code || '').trim().toUpperCase();
+      return (cId && upperList.includes(cId)) || (cCode && upperList.includes(cCode));
+    };
+
+    // Helper: Return updated student object with course added to AllowedCourses
+    const buildStudentWithAddedCourse = (student, course) => {
+      const currentList = parseAllowedCoursesList(student.AllowedCourses);
+      if (currentList.includes('*')) return { ...student };
+      const cId = String(course.CourseID || '').trim();
+      const upperList = currentList.map(s => s.toUpperCase());
+      if (!upperList.includes(cId.toUpperCase())) {
+        currentList.push(cId);
+      }
+      return {
+        ...student,
+        AllowedCourses: currentList.join(',')
+      };
+    };
+
+    // Helper: Return updated student object with course removed from AllowedCourses
+    const buildStudentWithRemovedCourse = (student, course, allCourses = []) => {
+      let currentList = parseAllowedCoursesList(student.AllowedCourses);
+      const cId = String(course.CourseID || '').trim().toUpperCase();
+      const cCode = String(course.Code || '').trim().toUpperCase();
+
+      // หากเดิมเป็น '*' (ทุกวิชา) ให้แตกเป็นรหัสวิชาทั้งหมดก่อน แล้วค่อยตัดวิชานี้ออก
+      if (currentList.includes('*')) {
+        currentList = (allCourses || []).map(c => String(c.CourseID || '').trim()).filter(Boolean);
+      }
+
+      const filtered = currentList.filter(item => {
+        const up = item.toUpperCase();
+        return up !== cId && (!cCode || up !== cCode);
+      });
+
+      return {
+        ...student,
+        AllowedCourses: filtered.length > 0 ? filtered.join(',') : 'NONE'
+      };
+    };
+
+    // Helper: Copy text (such as CourseID) to clipboard with toast notification
+    const copyToClipboardToast = (text, label = 'CourseID') => {
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(String(text || ''));
+      }
+      Swal.fire({
+        toast: true,
+        position: 'top-end',
+        icon: 'success',
+        title: `คัดลอก ${label}: ${text} แล้ว`,
+        showConfirmButton: false,
+        timer: 1500
+      });
+    };
+
     // --- Main Application Component ---
     function EduPortalApp() {
       const [gasUrl, setGasUrl] = useState(() => {
@@ -773,13 +844,11 @@
           return (db.Courses || []).filter(c => c.TeacherID === currentUser.user.TeacherID);
         }
         if (currentUser.role === 'student') {
-          const allowedStr = currentUser.user.AllowedCourses || '';
-          if (!allowedStr || allowedStr === '*' || allowedStr.trim() === '') return db.Courses || [];
-          const allowedList = allowedStr.split(',').map(s => s.trim().toUpperCase());
-          return (db.Courses || []).filter(c => allowedList.includes(String(c.CourseID).toUpperCase()) || allowedList.includes(String(c.Code).toUpperCase()));
+          const liveStudent = (db.Students || []).find(s => isSameStudentId(s.StudentID, currentUser.user?.StudentID)) || currentUser.user;
+          return (db.Courses || []).filter(c => isStudentEnrolledInCourse(liveStudent, c));
         }
         return [];
-      }, [db.Courses, currentUser]);
+      }, [db.Courses, db.Students, currentUser]);
 
       const selectedCourse = useMemo(() => {
         if (!selectedCourseId) return null;
@@ -929,17 +998,20 @@
                   <CoursesView
                     courses={visibleCourses}
                     teachers={db.Teachers || []}
+                    students={db.Students || []}
                     currentUser={currentUser}
                     onSelectCourse={(c) => { setCourseTab('lessons'); setSelectedCourseId(c.CourseID); }}
+                    onManageCourseStudents={(c) => { setCourseTab('students'); setSelectedCourseId(c.CourseID); }}
                     onSaveCourse={(c) => saveRecordToSheet('Courses', c)}
                     onDeleteCourse={(id) => deleteRecordFromSheet('Courses', id)}
                   />
                 )}
 
-                {currentTab === 'students' && currentUser.role === 'admin' && (
+                {currentTab === 'students' && (currentUser.role === 'admin' || currentUser.role === 'teacher') && (
                   <StudentsManagementView
                     students={db.Students || []}
                     courses={db.Courses || []}
+                    currentUser={currentUser}
                     gasUrl={gasUrl}
                     callGasApi={callGasApi}
                     onSaveStudent={(st) => saveRecordToSheet('Students', st)}
@@ -1063,6 +1135,7 @@
 
                   {currentUser.role === 'teacher' && (
                     <>
+                      <TabButton active={currentTab === 'students'} onClick={() => setCurrentTab('students')} icon="Users" label="จัดการนักเรียน" />
                       <TabButton active={currentTab === 'announcements'} onClick={() => setCurrentTab('announcements')} icon="Bell" label="ประกาศโรงเรียน" />
                       <TabButton active={currentTab === 'ai_settings'} onClick={() => setCurrentTab('ai_settings')} icon="Sparkles" label="ตั้งค่าโมเดล AI" />
                     </>
@@ -1146,12 +1219,15 @@
         const assignCount = (db.Assignments || []).filter(a => a.CourseID === selectedCourse.CourseID).length;
         const examCount = (db.Exams || []).filter(e => e.CourseID === selectedCourse.CourseID && (currentUser.role !== 'student' || String(e.Published) !== 'false')).length;
 
+        const enrolledCount = (db.Students || []).filter(st => isStudentEnrolledInCourse(st, selectedCourse)).length;
         const courseNavItems = [
           { id: 'back', label: 'หน้าวิชา', icon: 'ArrowLeft', action: onBackFromCourse },
           { id: 'lessons', label: 'บทเรียน', icon: 'BookOpen', badge: lessonCount },
           { id: 'assignments', label: 'การบ้าน', icon: 'FileText', badge: assignCount },
           { id: 'exams', label: 'ข้อสอบ', icon: 'Clock', badge: examCount },
-          { id: 'evaluations', label: 'ประเมินครู', icon: 'Star' }
+          ...(currentUser.role === 'admin' || currentUser.role === 'teacher'
+            ? [{ id: 'students', label: 'ผู้เรียน', icon: 'Users', badge: enrolledCount }]
+            : [{ id: 'evaluations', label: 'ประเมินครู', icon: 'Star' }])
         ];
 
         return (
@@ -1204,10 +1280,11 @@
           ]
         : currentUser.role === 'teacher'
           ? [
-              { id: 'courses', label: 'รายวิชาเรียน', icon: 'BookOpen' },
+              { id: 'courses', label: 'รายวิชา', icon: 'BookOpen' },
+              { id: 'students', label: 'นักเรียน', icon: 'Users' },
               { id: 'ai_settings', label: 'ตั้งค่า AI', icon: 'Sparkles' },
               { id: 'announcements', label: 'ประกาศ', icon: 'Bell' },
-              { id: 'profile', label: 'บัญชีของฉัน', icon: 'User', action: onOpenProfile }
+              { id: 'profile', label: 'บัญชีฉัน', icon: 'User', action: onOpenProfile }
             ]
           : [
               { id: 'courses', label: 'รายวิชาเรียน', icon: 'BookOpen' },
@@ -1821,7 +1898,7 @@
     }
 
     // --- Courses View Component ---
-    function CoursesView({ courses, teachers, currentUser, onSelectCourse, onSaveCourse, onDeleteCourse }) {
+    function CoursesView({ courses, teachers, students = [], currentUser, onSelectCourse, onManageCourseStudents, onSaveCourse, onDeleteCourse }) {
       const [showModal, setShowModal] = useState(false);
       const [editingCourse, setEditingCourse] = useState(null);
 
@@ -1921,22 +1998,38 @@
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {courses.map(course => (
+              {courses.map(course => {
+                const enrolledCount = (students || []).filter(st => isStudentEnrolledInCourse(st, course)).length;
+                const canManage = currentUser.role === 'admin' || (currentUser.role === 'teacher' && course.TeacherID === currentUser.user.TeacherID);
+                return (
                 <div
                   key={course.CourseID}
                   onClick={() => onSelectCourse(course)}
                   className="bg-white rounded-3xl overflow-hidden border border-slate-200 card-hover cursor-pointer flex flex-col group shadow-sm"
                 >
-                  <div className={`h-36 bg-gradient-to-br ${course.CoverColor || 'from-indigo-600 to-blue-700'} p-5 text-white flex flex-col justify-between relative`}>
-                    <div className="flex items-start justify-between">
-                      <span className="px-2.5 py-1 bg-white/20 backdrop-blur-md rounded-lg text-xs font-mono font-bold tracking-wider">
-                        {course.Code}
-                      </span>
-                      <div className="flex items-center gap-2">
+                  <div className={`h-40 bg-gradient-to-br ${course.CoverColor || 'from-indigo-600 to-blue-700'} p-5 text-white flex flex-col justify-between relative`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="px-2.5 py-1 bg-white/20 backdrop-blur-md rounded-lg text-xs font-mono font-bold tracking-wider">
+                          {course.Code}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            copyToClipboardToast(course.CourseID, 'CourseID');
+                          }}
+                          title="คลิกเพื่อคัดลอก CourseID"
+                          className="px-2 py-0.5 bg-amber-400/90 hover:bg-amber-300 text-slate-950 rounded-md text-[11px] font-mono font-black flex items-center gap-1 shadow-sm transition"
+                        >
+                          <span>ID: {course.CourseID}</span>
+                        </button>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
                         <span className="px-2 py-0.5 bg-black/20 rounded-md text-[11px] font-medium">
                           {course.GradeLevel} • {course.Term}
                         </span>
-                        {(currentUser.role === 'admin' || (currentUser.role === 'teacher' && course.TeacherID === currentUser.user.TeacherID)) && (
+                        {canManage && (
                           <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
                             <button
                               onClick={(e) => handleOpenEdit(course, e)}
@@ -1961,28 +2054,47 @@
                       <h3 className="font-extrabold text-lg line-clamp-1 group-hover:text-white/95 transition">
                         {course.Name}
                       </h3>
-                      <p className="text-xs text-white/80 mt-1 flex items-center gap-1">
-                        <Icon name="UserCheck" size={13} />
-                        <span>{course.TeacherName}</span>
+                      <p className="text-xs text-white/80 mt-1 flex items-center justify-between">
+                        <span className="flex items-center gap-1">
+                          <Icon name="UserCheck" size={13} />
+                          <span>{course.TeacherName}</span>
+                        </span>
+                        <span className="bg-white/20 px-2 py-0.5 rounded-full text-[11px] font-bold flex items-center gap-1">
+                          <Icon name="Users" size={12} />
+                          <span>นักเรียน {enrolledCount} คน</span>
+                        </span>
                       </p>
                     </div>
                   </div>
 
-                  <div className="p-5 flex-1 flex flex-col justify-between">
-                    <div className="flex items-center justify-between text-xs text-slate-500 mb-4">
+                  <div className="p-5 flex-1 flex flex-col justify-between space-y-3">
+                    <div className="flex items-center justify-between text-xs text-slate-500">
                       <span>น้ำหนัก: {course.Credits || '1.5'} หน่วยกิต</span>
-                      <span className="flex items-center gap-1 text-indigo-600 font-semibold group-hover:translate-x-0.5 transition">
-                        เข้าสู่ห้องเรียน
-                        <Icon name="ChevronRight" size={15} />
-                      </span>
+                      <span className="font-mono text-[11px] text-slate-400">CourseID: <b className="text-indigo-600">{course.CourseID}</b></span>
                     </div>
 
-                    <div className="w-full py-2 bg-slate-50 group-hover:bg-indigo-50 text-slate-700 group-hover:text-indigo-700 font-bold text-xs rounded-xl text-center border border-slate-200 group-hover:border-indigo-200 transition">
-                      เข้าเรียน & ส่งงาน
+                    <div className="grid grid-cols-1 gap-2">
+                      {canManage && onManageCourseStudents && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onManageCourseStudents(course);
+                          }}
+                          className="w-full py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 border border-emerald-200 transition"
+                        >
+                          <Icon name="Users" size={14} />
+                          <span>ลงทะเบียน / จัดการนักเรียนในวิชา ({enrolledCount} คน)</span>
+                        </button>
+                      )}
+                      <div className="w-full py-2 bg-slate-50 group-hover:bg-indigo-50 text-slate-700 group-hover:text-indigo-700 font-bold text-xs rounded-xl text-center border border-slate-200 group-hover:border-indigo-200 transition">
+                        เข้าเรียน & จัดการบทเรียน
+                      </div>
                     </div>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
 
@@ -1991,15 +2103,33 @@
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
               <div className="bg-white rounded-3xl max-w-lg w-full p-6 shadow-2xl border border-slate-100 space-y-4">
                 <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                  <h3 className="text-lg font-bold text-slate-900">
-                    {courses.some(c => c.CourseID === editingCourse.CourseID) ? 'แก้ไขรายวิชา' : 'เพิ่มรายวิชาใหม่'}
-                  </h3>
+                  <div>
+                    <h3 className="text-lg font-bold text-slate-900">
+                      {courses.some(c => c.CourseID === editingCourse.CourseID) ? 'แก้ไขรายวิชา' : 'เพิ่มรายวิชาใหม่'}
+                    </h3>
+                    <p className="text-xs text-slate-500 font-mono mt-0.5">
+                      CourseID ของวิชานี้: <span className="font-bold text-indigo-600">{editingCourse.CourseID}</span>
+                    </p>
+                  </div>
                   <button onClick={() => setShowModal(false)} className="text-slate-400 hover:text-slate-600">
                     <Icon name="X" size={20} />
                   </button>
                 </div>
 
                 <form onSubmit={handleSaveSubmit} className="space-y-4">
+                  <div className="p-3 bg-indigo-50/70 border border-indigo-100 rounded-2xl flex items-center justify-between">
+                    <div>
+                      <span className="text-[11px] font-bold text-indigo-900 block">รหัสอ้างอิงระบบ (CourseID สำหรับ AllowedCourses)</span>
+                      <span className="text-sm font-mono font-black text-indigo-700">{editingCourse.CourseID}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboardToast(editingCourse.CourseID, 'CourseID')}
+                      className="px-3 py-1.5 bg-white hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-xl text-xs font-bold transition"
+                    >
+                      คัดลอก CourseID
+                    </button>
+                  </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs font-bold text-slate-700 mb-1">รหัสวิชา</label>
@@ -2140,6 +2270,10 @@
         return (db.Evaluations || []).filter(ev => ev.CourseID === course.CourseID);
       }, [db.Evaluations, course.CourseID]);
 
+      const enrolledStudents = useMemo(() => {
+        return (db.Students || []).filter(st => isStudentEnrolledInCourse(st, course));
+      }, [db.Students, course]);
+
       return (
         <div className="space-y-4 sm:space-y-6">
           {/* Top Return & Course Banner */}
@@ -2159,20 +2293,41 @@
                     <span className="px-2.5 py-0.5 sm:px-3 sm:py-1 bg-white/20 backdrop-blur-md rounded-lg text-xs font-mono font-bold tracking-wider">
                       {course.Code}
                     </span>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboardToast(course.CourseID, 'CourseID')}
+                      title="คลิกเพื่อคัดลอก CourseID"
+                      className="px-2.5 py-0.5 sm:px-3 sm:py-1 bg-amber-400 hover:bg-amber-300 text-slate-950 rounded-lg text-xs font-mono font-black flex items-center gap-1.5 shadow-sm transition"
+                    >
+                      <span>CourseID: {course.CourseID}</span>
+                      <span className="text-[10px] bg-black/15 px-1.5 py-0.2 rounded">คัดลอก</span>
+                    </button>
                     <span className="text-[11px] sm:text-xs bg-black/20 px-2.5 py-0.5 sm:py-1 rounded-md">
                       {course.GradeLevel} • ภาคเรียน {course.Term}
                     </span>
                   </div>
                   <h1 className="text-xl sm:text-3xl font-black tracking-tight leading-snug">{course.Name}</h1>
-                  <p className="text-xs sm:text-sm text-white/85 flex items-center gap-1.5 pt-0.5">
-                    <Icon name="UserCheck" size={15} />
-                    <span>ครูผู้สอน: {course.TeacherName}</span>
+                  <p className="text-xs sm:text-sm text-white/85 flex items-center gap-3 flex-wrap pt-0.5">
+                    <span className="flex items-center gap-1.5">
+                      <Icon name="UserCheck" size={15} />
+                      <span>ครูผู้สอน: {course.TeacherName}</span>
+                    </span>
+                    <span className="flex items-center gap-1 bg-white/15 px-2.5 py-0.5 rounded-full text-xs font-bold">
+                      <Icon name="Users" size={13} />
+                      <span>ผู้เรียนในวิชานี้: {enrolledStudents.length} คน</span>
+                    </span>
                   </p>
                 </div>
 
-                <div className="hidden sm:block bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-white/15 text-center min-w-[130px]">
-                  <span className="text-2xl font-black block">{courseLessons.length}</span>
-                  <span className="text-[11px] text-white/80 font-medium">บทเรียนในวิชา</span>
+                <div className="hidden sm:flex items-center gap-3">
+                  <div className="bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-white/15 text-center min-w-[115px]">
+                    <span className="text-2xl font-black block">{enrolledStudents.length}</span>
+                    <span className="text-[11px] text-white/80 font-medium">นักเรียนในวิชา</span>
+                  </div>
+                  <div className="bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-white/15 text-center min-w-[115px]">
+                    <span className="text-2xl font-black block">{courseLessons.length}</span>
+                    <span className="text-[11px] text-white/80 font-medium">บทเรียนในวิชา</span>
+                  </div>
                 </div>
               </div>
 
@@ -2207,6 +2362,18 @@
                   <Icon name="Clock" size={15} />
                   <span>ข้อสอบ ({courseExams.length})</span>
                 </button>
+
+                {(currentUser.role === 'admin' || currentUser.role === 'teacher') && (
+                  <button
+                    onClick={() => setCourseTab('students')}
+                    className={`px-3 py-2.5 sm:px-4 sm:py-2 rounded-xl text-xs font-bold transition flex items-center justify-center sm:justify-start gap-1.5 ${
+                      courseTab === 'students' ? 'bg-amber-400 text-slate-950 shadow-md' : 'bg-white/15 text-white hover:bg-white/25 border border-white/20'
+                    }`}
+                  >
+                    <Icon name="Users" size={15} />
+                    <span>นักเรียนในวิชา ({enrolledStudents.length})</span>
+                  </button>
+                )}
 
                 <button
                   onClick={() => setCourseTab('evaluations')}
@@ -2259,6 +2426,17 @@
               />
             )}
 
+            {courseTab === 'students' && (currentUser.role === 'admin' || currentUser.role === 'teacher') && (
+              <CourseStudentsEnrollmentView
+                course={course}
+                allCourses={db.Courses || []}
+                allStudents={db.Students || []}
+                courseSubmissions={courseSubmissions}
+                courseExamAttempts={courseExamAttempts}
+                onSaveStudent={(st) => onSaveRecord('Students', st)}
+              />
+            )}
+
             {courseTab === 'evaluations' && (
               <EvaluationsView
                 course={course}
@@ -2270,6 +2448,545 @@
               />
             )}
           </div>
+        </div>
+      );
+    }
+
+    // --- Course Students Enrollment & Management View (For Teachers & Admins inside a Course) ---
+    function CourseStudentsEnrollmentView({ course, allCourses, allStudents, courseSubmissions, courseExamAttempts, onSaveStudent }) {
+      const [dropdownSearch, setDropdownSearch] = useState('');
+      const [isDropdownOpen, setIsDropdownOpen] = useState(false);
+      const [enrolledSearch, setEnrolledSearch] = useState('');
+      const [gradeFilter, setGradeFilter] = useState('ALL');
+      const [showQuickNewStudentModal, setShowQuickNewStudentModal] = useState(false);
+      const [newStudentForm, setNewStudentForm] = useState({
+        StudentID: '',
+        PIN: '1234',
+        Name: '',
+        Grade: course.GradeLevel ? `${course.GradeLevel}/1` : 'ม.3/1',
+        Email: ''
+      });
+
+      const enrolledStudents = useMemo(() => {
+        return (allStudents || []).filter(st => isStudentEnrolledInCourse(st, course));
+      }, [allStudents, course]);
+
+      const unenrolledStudents = useMemo(() => {
+        return (allStudents || []).filter(st => !isStudentEnrolledInCourse(st, course));
+      }, [allStudents, course]);
+
+      // Filtered options for the Auto-Dropdown
+      const dropdownCandidates = useMemo(() => {
+        const q = dropdownSearch.trim().toLowerCase();
+        if (!q) return unenrolledStudents;
+        return unenrolledStudents.filter(st =>
+          String(st.StudentID || '').toLowerCase().includes(q) ||
+          String(st.Name || '').toLowerCase().includes(q) ||
+          String(st.Grade || '').toLowerCase().includes(q)
+        );
+      }, [unenrolledStudents, dropdownSearch]);
+
+      // Group unenrolled students by classroom (Grade) for 1-click classroom enrollment
+      const unenrolledByGrade = useMemo(() => {
+        const map = {};
+        unenrolledStudents.forEach(st => {
+          const g = st.Grade || 'ไม่ระบุชั้นเรียน';
+          if (!map[g]) map[g] = [];
+          map[g].push(st);
+        });
+        return map;
+      }, [unenrolledStudents]);
+
+      // Unique grades among enrolled students for filtering
+      const enrolledGrades = useMemo(() => {
+        const set = new Set();
+        enrolledStudents.forEach(st => {
+          if (st.Grade) set.add(st.Grade);
+        });
+        return Array.from(set).sort();
+      }, [enrolledStudents]);
+
+      const filteredEnrolledStudents = useMemo(() => {
+        return enrolledStudents.filter(st => {
+          if (gradeFilter !== 'ALL' && st.Grade !== gradeFilter) return false;
+          const q = enrolledSearch.trim().toLowerCase();
+          if (!q) return true;
+          return (
+            String(st.StudentID || '').toLowerCase().includes(q) ||
+            String(st.Name || '').toLowerCase().includes(q) ||
+            String(st.Grade || '').toLowerCase().includes(q)
+          );
+        });
+      }, [enrolledStudents, gradeFilter, enrolledSearch]);
+
+      // Enroll a single student into this course
+      const handleEnrollOne = async (student) => {
+        const updated = buildStudentWithAddedCourse(student, course);
+        await onSaveStudent(updated);
+        Swal.fire({
+          toast: true,
+          position: 'top-end',
+          icon: 'success',
+          title: `เพิ่ม ${student.Name} เข้าวิชา ${course.CourseID} แล้ว`,
+          showConfirmButton: false,
+          timer: 1500
+        });
+      };
+
+      // Enroll an entire classroom (Grade) or list of students at once
+      const handleEnrollGroup = async (studentsList, groupLabel) => {
+        if (!studentsList || studentsList.length === 0) return;
+        const confirm = await Swal.fire({
+          title: `ลงทะเบียนนักเรียน ${groupLabel}?`,
+          text: `ต้องการเพิ่มนักเรียนจำนวน ${studentsList.length} คน เข้าเรียนวิชา ${course.Name} (${course.CourseID}) หรือไม่?`,
+          icon: 'question',
+          showCancelButton: true,
+          confirmButtonText: `เพิ่มทั้ง ${studentsList.length} คน`,
+          cancelButtonText: 'ยกเลิก',
+          confirmButtonColor: '#10b981'
+        });
+        if (!confirm.isConfirmed) return;
+
+        for (const st of studentsList) {
+          const updated = buildStudentWithAddedCourse(st, course);
+          await onSaveStudent(updated);
+        }
+
+        Swal.fire({
+          icon: 'success',
+          title: 'ลงทะเบียนเข้าวิชาสำเร็จ!',
+          text: `เพิ่มนักเรียน ${studentsList.length} คน เข้าสู่วิชา ${course.CourseID} เรียบร้อยแล้ว`,
+          timer: 1600,
+          showConfirmButton: false
+        });
+      };
+
+      // Remove a single student from this course
+      const handleRemoveFromCourse = async (student) => {
+        const confirm = await Swal.fire({
+          title: 'ถอนนักเรียนออกจากวิชานี้?',
+          html: `ต้องการลบ <b>${student.Name} (${student.StudentID})</b> ออกจากวิชา <b>${course.Name} (${course.CourseID})</b> หรือไม่?<br/><span class="text-xs text-slate-500">(ข้อมูลบัญชีนักเรียนและวิชาอื่นที่นักเรียนเรียนอยู่จะไม่ถูกลบ)</span>`,
+          icon: 'warning',
+          showCancelButton: true,
+          confirmButtonText: 'ลบออกจากวิชานี้',
+          cancelButtonText: 'ยกเลิก',
+          confirmButtonColor: '#ef4444'
+        });
+        if (!confirm.isConfirmed) return;
+
+        const updated = buildStudentWithRemovedCourse(student, course, allCourses);
+        await onSaveStudent(updated);
+
+        Swal.fire({
+          toast: true,
+          position: 'top-end',
+          icon: 'success',
+          title: `นำ ${student.Name} ออกจากวิชา ${course.CourseID} แล้ว`,
+          showConfirmButton: false,
+          timer: 1500
+        });
+      };
+
+      // Create a brand new student and enroll in this course immediately
+      const handleCreateAndEnrollStudent = async (e) => {
+        e.preventDefault();
+        const existing = (allStudents || []).find(s => isSameStudentId(s.StudentID, newStudentForm.StudentID));
+        if (existing) {
+          // หากมีรหัสนี้อยู่แล้ว ให้เพิ่มวิชานี้ให้เลย
+          const updated = buildStudentWithAddedCourse(existing, course);
+          await onSaveStudent(updated);
+          setShowQuickNewStudentModal(false);
+          Swal.fire({ icon: 'success', title: 'พบรหัสนักเรียนเดิม เพิ่มเข้าวิชานี้เรียบร้อย!', timer: 1500, showConfirmButton: false });
+          return;
+        }
+
+        const newStudent = {
+          ID: 'S_' + Date.now().toString().slice(-6),
+          StudentID: newStudentForm.StudentID.trim(),
+          PIN: newStudentForm.PIN.trim() || '1234',
+          Name: newStudentForm.Name.trim(),
+          Email: newStudentForm.Email.trim(),
+          Grade: newStudentForm.Grade.trim() || 'ม.3/1',
+          AllowedCourses: course.CourseID,
+          CreatedAt: new Date().toISOString().split('T')[0]
+        };
+
+        await onSaveStudent(newStudent);
+        setShowQuickNewStudentModal(false);
+        setNewStudentForm({
+          StudentID: '',
+          PIN: '1234',
+          Name: '',
+          Grade: course.GradeLevel ? `${course.GradeLevel}/1` : 'ม.3/1',
+          Email: ''
+        });
+        Swal.fire({ icon: 'success', title: 'สร้างและลงทะเบียนนักเรียนเข้าวิชาสำเร็จ!', timer: 1500, showConfirmButton: false });
+      };
+
+      return (
+        <div className="space-y-6">
+          {/* Header & CourseID Info Card */}
+          <div className="bg-white rounded-3xl p-5 sm:p-6 border border-slate-200 shadow-sm flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 flex-wrap">
+                <h2 className="text-lg sm:text-xl font-black text-slate-900">จัดการนักเรียนลงทะเบียนในรายวิชา</h2>
+                <span className="px-3 py-1 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full text-xs font-mono font-extrabold">
+                  CourseID: {course.CourseID}
+                </span>
+                <span className="px-2.5 py-1 bg-slate-100 text-slate-700 rounded-full text-xs font-mono font-bold">
+                  รหัสวิชา: {course.Code}
+                </span>
+              </div>
+              <p className="text-xs text-slate-500">
+                ครูสามารถค้นหาและเลือกนักเรียนเข้าเรียนวิชานี้ผ่าน Auto-Dropdown ลงทะเบียนยกห้องเรียน หรือถอนนักเรียนออกจากวิชานี้ได้ทันที
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => copyToClipboardToast(course.CourseID, 'CourseID')}
+                className="px-3.5 py-2 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 rounded-xl text-xs font-bold flex items-center gap-1.5 transition"
+              >
+                <Icon name="FileText" size={15} />
+                <span>คัดลอก CourseID ({course.CourseID})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowQuickNewStudentModal(true)}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-md flex items-center gap-1.5 transition"
+              >
+                <Icon name="Plus" size={15} />
+                <span>สร้างนักเรียนใหม่เข้าวิชานี้</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Auto-Dropdown Student Picker & Quick Classroom Enrollment */}
+          <div className="bg-gradient-to-br from-indigo-50/80 via-white to-emerald-50/50 rounded-3xl p-5 sm:p-6 border border-indigo-100 shadow-sm space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-extrabold text-slate-900 flex items-center gap-2">
+                  <Icon name="Users" size={18} className="text-indigo-600" />
+                  <span>เพิ่มนักเรียนเข้าเรียนวิชานี้ (Auto-Dropdown ค้นหาอัตโนมัติ)</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  คลิกที่ช่องค้นหาเพื่อเปิดรายชื่อนักเรียนที่ยังไม่ได้ลงทะเบียนในวิชา <b>{course.Name} ({course.CourseID})</b> ({unenrolledStudents.length} คน)
+                </p>
+              </div>
+              {unenrolledStudents.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => handleEnrollGroup(unenrolledStudents, 'ทั้งหมดในระบบ')}
+                  className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold shadow-sm transition self-start sm:self-auto"
+                >
+                  + เพิ่มนักเรียนที่เหลือทั้งหมด ({unenrolledStudents.length} คน)
+                </button>
+              )}
+            </div>
+
+            {/* Interactive Auto-Dropdown Search Box */}
+            <div className="relative">
+              <div className="flex items-center bg-white border-2 border-indigo-200 focus-within:border-indigo-600 rounded-2xl px-3.5 py-2.5 shadow-sm transition">
+                <Icon name="Search" size={18} className="text-indigo-500 shrink-0 mr-2.5" />
+                <input
+                  type="text"
+                  value={dropdownSearch}
+                  onFocus={() => setIsDropdownOpen(true)}
+                  onChange={(e) => {
+                    setDropdownSearch(e.target.value);
+                    setIsDropdownOpen(true);
+                  }}
+                  placeholder={
+                    unenrolledStudents.length === 0
+                      ? 'นักเรียนทุกคนในระบบลงทะเบียนในวิชานี้ครบแล้ว!'
+                      : 'คลิกหรือพิมพ์รหัสนักเรียน, ชื่อ-นามสกุล, หรือชั้นเรียน (เช่น ม.3/1) เพื่อเลือกเพิ่มเข้าวิชา...'
+                  }
+                  className="w-full text-xs sm:text-sm bg-transparent focus:outline-none text-slate-800"
+                />
+                {dropdownSearch && (
+                  <button
+                    type="button"
+                    onClick={() => setDropdownSearch('')}
+                    className="text-slate-400 hover:text-slate-600 px-1.5"
+                  >
+                    <Icon name="X" size={16} />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setIsDropdownOpen(prev => !prev)}
+                  className="ml-1 px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-xl text-xs font-bold flex items-center gap-1 shrink-0"
+                >
+                  <span>{isDropdownOpen ? 'ปิดรายการ' : `เลือกจากรายชื่อ (${unenrolledStudents.length})`}</span>
+                  <Icon name="ChevronRight" size={14} className={isDropdownOpen ? 'rotate-90 transition' : 'transition'} />
+                </button>
+              </div>
+
+              {/* Floating Auto-Dropdown Menu */}
+              {isDropdownOpen && (
+                <div className="mt-2 bg-white rounded-2xl border border-slate-200 shadow-xl max-h-72 overflow-y-auto custom-scroll divide-y divide-slate-100 z-20">
+                  {dropdownCandidates.length === 0 ? (
+                    <div className="p-6 text-center text-xs text-slate-400 space-y-2">
+                      <p>ไม่พบรายชื่อนักเรียนที่ยังไม่ได้ลงทะเบียนตามคำค้นหา</p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsDropdownOpen(false);
+                          setShowQuickNewStudentModal(true);
+                        }}
+                        className="px-3 py-1.5 bg-indigo-50 text-indigo-700 rounded-xl font-bold hover:bg-indigo-100 transition"
+                      >
+                        + สร้างรายชื่อนักเรียนใหม่เข้าวิชานี้ทันที
+                      </button>
+                    </div>
+                  ) : (
+                    dropdownCandidates.map(st => (
+                      <div
+                        key={st.StudentID}
+                        className="px-4 py-2.5 hover:bg-indigo-50/60 flex items-center justify-between gap-3 transition"
+                      >
+                        <div className="flex items-center gap-2.5 flex-wrap">
+                          <span className="font-mono font-bold text-xs px-2 py-0.5 bg-slate-100 text-indigo-700 rounded-lg">
+                            #{st.StudentID}
+                          </span>
+                          <span className="font-bold text-xs sm:text-sm text-slate-800">{st.Name}</span>
+                          <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-md text-[11px] font-semibold">
+                            {st.Grade || 'ไม่ระบุชั้น'}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleEnrollOne(st)}
+                          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold shadow-sm flex items-center gap-1 shrink-0 active:scale-95 transition"
+                        >
+                          <Icon name="Plus" size={14} />
+                          <span>เพิ่มเข้าวิชา</span>
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Quick 1-Click Classroom Buttons */}
+            {Object.keys(unenrolledByGrade).length > 0 && (
+              <div className="pt-1 flex items-center gap-2 flex-wrap">
+                <span className="text-[11px] font-bold text-slate-500">ลงทะเบียนด่วนยกห้องเรียน:</span>
+                {Object.entries(unenrolledByGrade).map(([gradeName, list]) => (
+                  <button
+                    key={gradeName}
+                    type="button"
+                    onClick={() => handleEnrollGroup(list, `ชั้น ${gradeName}`)}
+                    className="px-3 py-1 bg-white hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 border border-slate-200 hover:border-emerald-300 rounded-full text-xs font-bold flex items-center gap-1 shadow-sm transition"
+                  >
+                    <Icon name="Plus" size={12} className="text-emerald-600" />
+                    <span>เพิ่มทั้งห้อง {gradeName} ({list.length} คน)</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Enrolled Students List & Filter */}
+          <div className="bg-white rounded-3xl p-5 sm:p-6 border border-slate-200 shadow-sm space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h3 className="text-base font-extrabold text-slate-900">
+                  รายชื่อนักเรียนที่ลงทะเบียนในวิชานี้ ({enrolledStudents.length} คน)
+                </h3>
+                <p className="text-xs text-slate-500">
+                  นักเรียนในตารางนี้จะมองเห็นวิชา <b>{course.Name} ({course.CourseID})</b> และสามารถเข้าเรียน ส่งการบ้าน และทำข้อสอบได้
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={gradeFilter}
+                  onChange={(e) => setGradeFilter(e.target.value)}
+                  className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="ALL">ทุกห้องเรียน ({enrolledStudents.length} คน)</option>
+                  {enrolledGrades.map(g => (
+                    <option key={g} value={g}>{g}</option>
+                  ))}
+                </select>
+
+                <div className="flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5">
+                  <Icon name="Search" size={15} className="text-slate-400 mr-2" />
+                  <input
+                    type="text"
+                    value={enrolledSearch}
+                    onChange={(e) => setEnrolledSearch(e.target.value)}
+                    placeholder="ค้นหาในรายชื่อที่ลงทะเบียน..."
+                    className="text-xs bg-transparent focus:outline-none text-slate-700 w-44"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {filteredEnrolledStudents.length === 0 ? (
+              <div className="py-12 text-center text-slate-400 text-xs border border-dashed border-slate-200 rounded-2xl space-y-2">
+                <Icon name="Users" size={28} className="mx-auto text-slate-300" />
+                <p>ยังไม่มีนักเรียนลงทะเบียนในวิชานี้ หรือไม่พบตามเงื่อนไขที่ค้นหา</p>
+                <p className="text-[11px]">ใช้ช่อง Auto-Dropdown ด้านบนเพื่อเลือกเพิ่มนักเรียนเข้าสู่วิชานี้ได้ทันที</p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto custom-scroll">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 text-slate-600 font-bold border-b border-slate-200">
+                    <tr>
+                      <th className="py-3 px-4">รหัสนักเรียน</th>
+                      <th className="py-3 px-4">ชื่อ - นามสกุล</th>
+                      <th className="py-3 px-4">ระดับชั้น</th>
+                      <th className="py-3 px-4">การส่งงาน / สอบในวิชานี้</th>
+                      <th className="py-3 px-4">สิทธิ์วิชาทั้งหมด (AllowedCourses)</th>
+                      <th className="py-3 px-4 text-right">จัดการ</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {filteredEnrolledStudents.map(st => {
+                      const subCount = (courseSubmissions || []).filter(s => isSameStudentId(s.StudentID, st.StudentID)).length;
+                      const examCount = (courseExamAttempts || []).filter(ea => isSameStudentId(ea.StudentID, st.StudentID)).length;
+                      return (
+                        <tr key={st.StudentID} className="hover:bg-slate-50/80 transition">
+                          <td className="py-3 px-4 font-mono font-bold text-indigo-700">#{st.StudentID}</td>
+                          <td className="py-3 px-4 font-bold text-slate-800">{st.Name}</td>
+                          <td className="py-3 px-4">
+                            <span className="px-2.5 py-0.5 bg-slate-100 rounded-lg text-slate-700 font-semibold">{st.Grade}</span>
+                          </td>
+                          <td className="py-3 px-4">
+                            <div className="flex items-center gap-2">
+                              <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-md font-semibold">
+                                ส่งงาน {subCount} ครั้ง
+                              </span>
+                              <span className="px-2 py-0.5 bg-emerald-50 text-emerald-700 rounded-md font-semibold">
+                                สอบ {examCount} ครั้ง
+                              </span>
+                            </div>
+                          </td>
+                          <td className="py-3 px-4 font-mono text-[11px] text-slate-500">
+                            {st.AllowedCourses === '*' ? (
+                              <span className="px-2 py-0.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-md font-bold">
+                                ทุกวิชา (*)
+                              </span>
+                            ) : (
+                              st.AllowedCourses
+                            )}
+                          </td>
+                          <td className="py-3 px-4 text-right">
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveFromCourse(st)}
+                              className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 rounded-xl text-xs font-bold inline-flex items-center gap-1 transition active:scale-95"
+                              title="ถอนนักเรียนออกจากรายวิชานี้"
+                            >
+                              <Icon name="Trash2" size={13} />
+                              <span>ลบออกจากวิชานี้</span>
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* Modal Quick Create & Enroll Student */}
+          {showQuickNewStudentModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50 backdrop-blur-sm">
+              <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-slate-100 space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                  <div>
+                    <h3 className="text-base font-bold text-slate-900">เพิ่มนักเรียนใหม่เข้าวิชา {course.Code}</h3>
+                    <p className="text-xs text-slate-500">ระบบจะผูกสิทธิ์ CourseID: <b className="text-indigo-600">{course.CourseID}</b> ให้อัตโนมัติ</p>
+                  </div>
+                  <button onClick={() => setShowQuickNewStudentModal(false)} className="text-slate-400 hover:text-slate-600">
+                    <Icon name="X" size={18} />
+                  </button>
+                </div>
+
+                <form onSubmit={handleCreateAndEnrollStudent} className="space-y-3.5">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">รหัสนักเรียน *</label>
+                      <input
+                        type="text"
+                        required
+                        value={newStudentForm.StudentID}
+                        onChange={(e) => setNewStudentForm({ ...newStudentForm, StudentID: e.target.value })}
+                        placeholder="เช่น 04504"
+                        className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">PIN ล็อกอิน *</label>
+                      <input
+                        type="text"
+                        required
+                        value={newStudentForm.PIN}
+                        onChange={(e) => setNewStudentForm({ ...newStudentForm, PIN: e.target.value })}
+                        placeholder="1234"
+                        className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">ชื่อ - นามสกุล *</label>
+                    <input
+                      type="text"
+                      required
+                      value={newStudentForm.Name}
+                      onChange={(e) => setNewStudentForm({ ...newStudentForm, Name: e.target.value })}
+                      placeholder="เช่น ด.ช. ณัฐวุฒิ รักเรียน"
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">ระดับชั้น / ห้อง</label>
+                      <input
+                        type="text"
+                        value={newStudentForm.Grade}
+                        onChange={(e) => setNewStudentForm({ ...newStudentForm, Grade: e.target.value })}
+                        placeholder="เช่น ม.3/1"
+                        className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">อีเมล (ถ้ามี)</label>
+                      <input
+                        type="email"
+                        value={newStudentForm.Email}
+                        onChange={(e) => setNewStudentForm({ ...newStudentForm, Email: e.target.value })}
+                        placeholder="เว้นว่างได้"
+                        className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
+                    <button
+                      type="button"
+                      onClick={() => setShowQuickNewStudentModal(false)}
+                      className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl"
+                    >
+                      ยกเลิก
+                    </button>
+                    <button
+                      type="submit"
+                      className="px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl shadow-md"
+                    >
+                      บันทึกและเพิ่มเข้าวิชา
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
         </div>
       );
     }
@@ -7225,12 +7942,16 @@
       );
     }
 
-    // --- Admin Module: Students Management & High-Performance CSV Chunking ---
-    function StudentsManagementView({ students, courses, gasUrl, callGasApi, onSaveStudent, onDeleteStudent, onBatchImportSuccess }) {
+    // --- Admin & Teacher Module: Students Management, Course Enrollment & CSV Import ---
+    function StudentsManagementView({ students, courses, currentUser, gasUrl, callGasApi, onSaveStudent, onDeleteStudent, onBatchImportSuccess }) {
       const [searchQuery, setSearchQuery] = useState('');
+      const [filterCourseId, setFilterCourseId] = useState('ALL');
+      const [filterGrade, setFilterGrade] = useState('ALL');
       const [showModal, setShowModal] = useState(false);
       const [showImportModal, setShowImportModal] = useState(false);
       const [editingStudent, setEditingStudent] = useState(null);
+      const [courseDropdownQuery, setCourseDropdownQuery] = useState('');
+      const [isCourseDropdownOpen, setIsCourseDropdownOpen] = useState(false);
 
       // CSV Bulk Chunking State
       const [csvFile, setCsvFile] = useState(null);
@@ -7239,17 +7960,42 @@
       const [importProgress, setImportProgress] = useState(0);
       const [importStatusText, setImportStatusText] = useState('');
 
+      const myCourses = useMemo(() => {
+        if (!currentUser) return [];
+        if (currentUser.role === 'admin') return courses || [];
+        if (currentUser.role === 'teacher') {
+          return (courses || []).filter(c => c.TeacherID === currentUser.user?.TeacherID);
+        }
+        return [];
+      }, [courses, currentUser]);
+
+      const uniqueGrades = useMemo(() => {
+        const s = new Set();
+        (students || []).forEach(st => { if (st.Grade) s.add(st.Grade); });
+        return Array.from(s).sort();
+      }, [students]);
+
       const filteredStudents = useMemo(() => {
         const q = searchQuery.toLowerCase().trim();
-        if (!q) return students;
-        return students.filter(s =>
-          (s.StudentID || '').toLowerCase().includes(q) ||
-          (s.Name || '').toLowerCase().includes(q) ||
-          (s.Grade || '').toLowerCase().includes(q)
-        );
-      }, [students, searchQuery]);
+        return (students || []).filter(s => {
+          if (filterGrade !== 'ALL' && s.Grade !== filterGrade) return false;
+          if (filterCourseId !== 'ALL') {
+            const targetCourse = (courses || []).find(c => c.CourseID === filterCourseId);
+            if (targetCourse && !isStudentEnrolledInCourse(s, targetCourse)) return false;
+          }
+          if (!q) return true;
+          return (
+            (s.StudentID || '').toLowerCase().includes(q) ||
+            (s.Name || '').toLowerCase().includes(q) ||
+            (s.Grade || '').toLowerCase().includes(q)
+          );
+        });
+      }, [students, courses, searchQuery, filterGrade, filterCourseId]);
 
       const handleOpenAdd = () => {
+        const defaultCourseIds = myCourses.length > 0
+          ? myCourses.map(c => c.CourseID).join(',')
+          : courses.map(c => c.CourseID).join(',');
         setEditingStudent({
           ID: 'S' + Date.now().toString().slice(-4),
           StudentID: '',
@@ -7257,15 +8003,38 @@
           Name: '',
           Email: '', // Optional as per spec
           Grade: 'ม.3/1',
-          AllowedCourses: courses.map(c => c.CourseID).join(','),
+          AllowedCourses: defaultCourseIds,
           CreatedAt: new Date().toISOString().split('T')[0]
         });
+        setCourseDropdownQuery('');
+        setIsCourseDropdownOpen(false);
         setShowModal(true);
       };
 
       const handleOpenEdit = (st) => {
         setEditingStudent({ ...st });
+        setCourseDropdownQuery('');
+        setIsCourseDropdownOpen(false);
         setShowModal(true);
+      };
+
+      // Quick toggle a course for a student directly from the table row
+      const handleQuickToggleCourse = async (student, course) => {
+        const enrolled = isStudentEnrolledInCourse(student, course);
+        const updated = enrolled
+          ? buildStudentWithRemovedCourse(student, course, courses)
+          : buildStudentWithAddedCourse(student, course);
+        await onSaveStudent(updated);
+        Swal.fire({
+          toast: true,
+          position: 'top-end',
+          icon: 'success',
+          title: enrolled
+            ? `นำ ${student.Name} ออกจากวิชา ${course.CourseID} แล้ว`
+            : `เพิ่ม ${student.Name} เข้าวิชา ${course.CourseID} แล้ว`,
+          showConfirmButton: false,
+          timer: 1400
+        });
       };
 
       const handleDelete = (studentId) => {
@@ -7375,8 +8144,8 @@
         <div className="space-y-4 sm:space-y-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
-              <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight">จัดการข้อมูลนักเรียน (Students)</h1>
-              <p className="text-xs text-slate-500">จัดการรายชื่อ กำหนด PIN และการเข้าถึงรายวิชา (AllowedCourses)</p>
+              <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight">จัดการข้อมูลนักเรียนและลงทะเบียนวิชา (Students)</h1>
+              <p className="text-xs text-slate-500">จัดการรายชื่อ กำหนด PIN และเพิ่ม/ถอนสิทธิ์การเข้าเรียนรายวิชา (AllowedCourses)</p>
             </div>
 
             <div className="grid grid-cols-2 sm:flex items-center gap-2">
@@ -7398,16 +8167,96 @@
             </div>
           </div>
 
-          {/* Search bar */}
-          <div className="bg-white rounded-2xl p-3 border border-slate-200 flex items-center gap-3 shadow-sm">
-            <Icon name="Search" size={18} className="text-slate-400 shrink-0" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="ค้นหาด้วยรหัสนักเรียน, ชื่อ-นามสกุล, หรือชั้นเรียน..."
-              className="w-full text-xs bg-transparent focus:outline-none text-slate-700"
-            />
+          {/* Teacher / Admin CourseID Quick Reference & Filter Bar */}
+          {myCourses.length > 0 && (
+            <div className="bg-gradient-to-r from-indigo-50/90 via-white to-amber-50/60 rounded-2xl p-4 border border-indigo-100 shadow-sm space-y-2.5">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <span className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
+                  <Icon name="BookOpen" size={15} className="text-indigo-600" />
+                  <span>{currentUser?.role === 'teacher' ? 'รหัส CourseID รายวิชาที่คุณเปิดสอน (คลิกเพื่อคัดลอก):' : 'รหัส CourseID รายวิชาทั้งหมดในระบบ:'}</span>
+                </span>
+                <span className="text-[11px] text-slate-500">คลิกที่ป้ายวิชาเพื่อคัดลอก CourseID หรือกรองดูเฉพาะนักเรียนในวิชานั้น</span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {myCourses.map(c => {
+                  const count = (students || []).filter(st => isStudentEnrolledInCourse(st, c)).length;
+                  const isFiltered = filterCourseId === c.CourseID;
+                  return (
+                    <div
+                      key={c.CourseID}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs transition ${
+                        isFiltered
+                          ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                          : 'bg-white text-slate-700 border-slate-200 hover:border-indigo-300'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setFilterCourseId(isFiltered ? 'ALL' : c.CourseID)}
+                        className="font-bold flex items-center gap-1.5 text-left"
+                        title="คลิกเพื่อกรองดูนักเรียนในวิชานี้"
+                      >
+                        <span className={`font-mono font-black px-1.5 py-0.5 rounded text-[11px] ${isFiltered ? 'bg-white/20 text-white' : 'bg-amber-100 text-amber-900'}`}>
+                          {c.CourseID}
+                        </span>
+                        <span>{c.Code} {c.Name}</span>
+                        <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${isFiltered ? 'bg-white text-indigo-700' : 'bg-slate-100 text-slate-600'}`}>
+                          {count} คน
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => copyToClipboardToast(c.CourseID, 'CourseID')}
+                        title={`คัดลอก CourseID: ${c.CourseID}`}
+                        className={`ml-1 px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                          isFiltered ? 'bg-white/20 hover:bg-white/30 text-white' : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700'
+                        }`}
+                      >
+                        คัดลอก ID
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Search & Filters bar */}
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+            <div className="md:col-span-2 bg-white rounded-2xl p-3 border border-slate-200 flex items-center gap-3 shadow-sm">
+              <Icon name="Search" size={18} className="text-slate-400 shrink-0" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="ค้นหาด้วยรหัสนักเรียน, ชื่อ-นามสกุล, หรือชั้นเรียน..."
+                className="w-full text-xs bg-transparent focus:outline-none text-slate-700"
+              />
+            </div>
+
+            <select
+              value={filterCourseId}
+              onChange={(e) => setFilterCourseId(e.target.value)}
+              className="bg-white rounded-2xl px-3.5 py-2.5 border border-slate-200 text-xs font-bold text-slate-700 focus:outline-none focus:border-indigo-500 shadow-sm"
+            >
+              <option value="ALL">แสดงทุกวิชา ({students.length} คน)</option>
+              {(courses || []).map(c => (
+                <option key={c.CourseID} value={c.CourseID}>
+                  เฉพาะวิชา {c.CourseID} ({c.Code} {c.Name})
+                </option>
+              ))}
+            </select>
+
+            <select
+              value={filterGrade}
+              onChange={(e) => setFilterGrade(e.target.value)}
+              className="bg-white rounded-2xl px-3.5 py-2.5 border border-slate-200 text-xs font-bold text-slate-700 focus:outline-none focus:border-indigo-500 shadow-sm"
+            >
+              <option value="ALL">ทุกระดับชั้น / ห้องเรียน</option>
+              {uniqueGrades.map(g => (
+                <option key={g} value={g}>ชั้น {g}</option>
+              ))}
+            </select>
           </div>
 
           {/* Mobile Card List (Visible only on phones) */}
@@ -7417,7 +8266,10 @@
                 ไม่พบข้อมูลนักเรียนที่ตรงกับเงื่อนไข
               </div>
             ) : (
-              filteredStudents.map(student => (
+              filteredStudents.map(student => {
+                const enrolledList = (courses || []).filter(c => isStudentEnrolledInCourse(student, c));
+                const unenrolledMyCourses = myCourses.filter(c => !isStudentEnrolledInCourse(student, c));
+                return (
                 <div key={student.StudentID} className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm space-y-2.5">
                   <div className="flex items-start justify-between gap-2">
                     <div>
@@ -7439,7 +8291,7 @@
                       <button
                         onClick={() => handleOpenEdit(student)}
                         className="p-2 bg-slate-100 hover:bg-slate-200 rounded-xl text-slate-600 active:scale-95"
-                        title="แก้ไข"
+                        title="แก้ไข / จัดการรายวิชา"
                       >
                         <Icon name="Edit" size={15} />
                       </button>
@@ -7453,12 +8305,40 @@
                     </div>
                   </div>
 
-                  <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
-                    <span className="font-mono truncate max-w-[180px]">วิชา: {student.AllowedCourses || 'ทุกวิชา (*)'}</span>
-                    {student.Email && <span className="font-mono text-slate-400">{student.Email}</span>}
+                  <div className="pt-2 border-t border-slate-100 space-y-1.5">
+                    <div className="flex flex-wrap gap-1.5">
+                      {enrolledList.length === 0 ? (
+                        <span className="text-[11px] text-rose-500 font-semibold">ยังไม่ได้ลงทะเบียนวิชาใด</span>
+                      ) : (
+                        enrolledList.map(c => (
+                          <span key={c.CourseID} className="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-lg text-[11px] font-bold">
+                            <span>{c.CourseID} ({c.Code})</span>
+                            <button
+                              type="button"
+                              onClick={() => handleQuickToggleCourse(student, c)}
+                              className="text-rose-500 hover:text-rose-700 font-black ml-0.5"
+                              title="ถอนออกจากวิชานี้"
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))
+                      )}
+                      {unenrolledMyCourses.map(c => (
+                        <button
+                          key={c.CourseID}
+                          type="button"
+                          onClick={() => handleQuickToggleCourse(student, c)}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-[11px] font-bold"
+                        >
+                          <span>+ เพิ่ม {c.CourseID}</span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
-              ))
+                );
+              })
             )}
           </div>
 
@@ -7472,64 +8352,109 @@
                     <th className="py-3 px-4">ชื่อ - นามสกุล</th>
                     <th className="py-3 px-4">รหัส PIN</th>
                     <th className="py-3 px-4">ระดับชั้น</th>
-                    <th className="py-3 px-4">อีเมล (Optional)</th>
-                    <th className="py-3 px-4">สิทธิ์รายวิชา (AllowedCourses)</th>
+                    <th className="py-3 px-4">สิทธิ์รายวิชาที่ลงทะเบียน (AllowedCourses) — คลิก × เพื่อถอน หรือ + เพื่อเพิ่ม</th>
                     <th className="py-3 px-4 text-center">จัดการ</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {filteredStudents.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="py-12 text-center text-slate-400">
+                      <td colSpan={6} className="py-12 text-center text-slate-400">
                         ไม่พบข้อมูลนักเรียนที่ตรงกับเงื่อนไข
                       </td>
                     </tr>
                   ) : (
-                    filteredStudents.map(student => (
+                    filteredStudents.map(student => {
+                      const enrolledList = (courses || []).filter(c => isStudentEnrolledInCourse(student, c));
+                      const unenrolledMyCourses = myCourses.filter(c => !isStudentEnrolledInCourse(student, c));
+                      return (
                       <tr key={student.StudentID} className="hover:bg-slate-50">
                         <td className="py-3 px-4 font-mono font-bold text-indigo-700">{student.StudentID}</td>
-                        <td className="py-3 px-4 font-bold text-slate-800">{student.Name}</td>
+                        <td className="py-3 px-4">
+                          <div className="font-bold text-slate-800">{student.Name}</div>
+                          {student.Email && <div className="text-[10px] font-mono text-slate-400">{student.Email}</div>}
+                        </td>
                         <td className="py-3 px-4 font-mono text-slate-500 tracking-wider">{student.PIN || '1234'}</td>
                         <td className="py-3 px-4">
                           <span className="px-2 py-0.5 bg-slate-100 rounded text-slate-700 font-medium">{student.Grade}</span>
                         </td>
-                        <td className="py-3 px-4 text-slate-500 font-mono text-[11px]">{student.Email || '-'}</td>
-                        <td className="py-3 px-4 text-[11px] font-mono text-slate-600 max-w-xs truncate" title={student.AllowedCourses}>
-                          {student.AllowedCourses || 'ทุกวิชา (*)'}
+                        <td className="py-3 px-4">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {enrolledList.length === 0 ? (
+                              <span className="text-[11px] text-rose-500 font-semibold bg-rose-50 px-2 py-0.5 rounded-md">
+                                ยังไม่ได้ลงทะเบียนวิชาใด
+                              </span>
+                            ) : (
+                              enrolledList.map(c => (
+                                <span
+                                  key={c.CourseID}
+                                  className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-indigo-50 text-indigo-800 border border-indigo-200 rounded-xl text-[11px] font-bold"
+                                  title={`${c.Name} (CourseID: ${c.CourseID})`}
+                                >
+                                  <span className="font-mono font-black text-indigo-600">{c.CourseID}</span>
+                                  <span>{c.Code}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleQuickToggleCourse(student, c)}
+                                    className="w-4 h-4 rounded-full bg-indigo-200/70 hover:bg-rose-500 hover:text-white text-indigo-800 flex items-center justify-center text-xs leading-none transition"
+                                    title={`ลบนักเรียนออกจากวิชา ${c.CourseID} (${c.Name})`}
+                                  >
+                                    ×
+                                  </button>
+                                </span>
+                              ))
+                            )}
+
+                            {/* ปุ่มลัดให้ครูคลิก + เพิ่มวิชาที่ตัวเองสอนได้ทันทีในคลิกเดียว */}
+                            {unenrolledMyCourses.map(c => (
+                              <button
+                                key={c.CourseID}
+                                type="button"
+                                onClick={() => handleQuickToggleCourse(student, c)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 bg-emerald-50 hover:bg-emerald-600 text-emerald-700 hover:text-white border border-emerald-200 rounded-xl text-[11px] font-bold transition"
+                                title={`คลิกเพื่อลงทะเบียนเข้าวิชา ${c.Name} (${c.CourseID})`}
+                              >
+                                <Icon name="Plus" size={11} />
+                                <span>เพิ่ม {c.CourseID} ({c.Code})</span>
+                              </button>
+                            ))}
+                          </div>
                         </td>
                         <td className="py-3 px-4 text-center">
                           <div className="flex items-center justify-center gap-1">
                             <button
                               onClick={() => handleOpenEdit(student)}
-                              className="p-1 hover:bg-slate-100 rounded text-slate-500 hover:text-slate-700"
-                              title="แก้ไข"
+                              className="px-2.5 py-1 bg-slate-100 hover:bg-indigo-50 text-slate-700 hover:text-indigo-700 rounded-lg font-bold text-[11px] flex items-center gap-1 transition"
+                              title="แก้ไขข้อมูลและเลือกวิชาเรียน"
                             >
-                              <Icon name="Edit" size={15} />
+                              <Icon name="Edit" size={13} />
+                              <span>แก้ไข/เลือกวิชา</span>
                             </button>
                             <button
                               onClick={() => handleDelete(student.StudentID)}
-                              className="p-1 hover:bg-rose-50 rounded text-slate-400 hover:text-rose-600"
-                              title="ลบ"
+                              className="p-1.5 hover:bg-rose-50 rounded-lg text-slate-400 hover:text-rose-600"
+                              title="ลบรายชื่อนักเรียน"
                             >
                               <Icon name="Trash2" size={15} />
                             </button>
                           </div>
                         </td>
                       </tr>
-                    ))
+                      );
+                    })
                   )}
                 </tbody>
               </table>
             </div>
           </div>
 
-          {/* Modal Add/Edit Student */}
+          {/* Modal Add/Edit Student with Auto-Dropdown Course Selector */}
           {showModal && editingStudent && (
             <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-sm">
-              <div className="bg-white rounded-t-3xl sm:rounded-3xl max-w-lg w-full p-6 shadow-2xl border-t sm:border border-slate-100 space-y-4 bottom-sheet pb-safe">
+              <div className="bg-white rounded-t-3xl sm:rounded-3xl max-w-lg w-full p-6 shadow-2xl border-t sm:border border-slate-100 space-y-4 bottom-sheet pb-safe max-h-[92vh] overflow-y-auto custom-scroll">
                 <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                   <h3 className="text-lg font-bold text-slate-900">
-                    {students.some(s => s.StudentID === editingStudent.StudentID) ? 'แก้ไขข้อมูลนักเรียน' : 'เพิ่มนักเรียนรายใหม่'}
+                    {students.some(s => s.StudentID === editingStudent.StudentID) ? 'แก้ไขข้อมูลและรายวิชาของนักเรียน' : 'เพิ่มนักเรียนรายใหม่'}
                   </h3>
                   <button onClick={() => setShowModal(false)} className="text-slate-400 hover:text-slate-600">
                     <Icon name="X" size={20} />
@@ -7597,15 +8522,152 @@
                     </div>
                   </div>
 
-                  <div>
-                    <label className="block text-xs font-bold text-slate-700 mb-1">สิทธิ์การเข้าถึงรายวิชา (AllowedCourses)</label>
-                    <input
-                      type="text"
-                      value={editingStudent.AllowedCourses}
-                      onChange={(e) => setEditingStudent({ ...editingStudent, AllowedCourses: e.target.value })}
-                      placeholder="ใส่รหัสวิชาคั่นด้วยจุลภาค เช่น C101,C102 หรือ * เพื่อเข้าได้ทุกวิชา"
-                      className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono focus:outline-none focus:border-indigo-500"
-                    />
+                  {/* Interactive Auto-Dropdown Course Picker for AllowedCourses */}
+                  <div className="space-y-2.5 p-3.5 bg-slate-50 rounded-2xl border border-slate-200">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <label className="block text-xs font-extrabold text-slate-800">
+                        เลือกลงทะเบียนรายวิชา (AllowedCourses)
+                      </label>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {myCourses.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              let next = { ...editingStudent };
+                              myCourses.forEach(mc => { next = buildStudentWithAddedCourse(next, mc); });
+                              setEditingStudent(next);
+                            }}
+                            className="px-2 py-0.5 bg-emerald-100 hover:bg-emerald-200 text-emerald-800 rounded-lg text-[11px] font-bold transition"
+                          >
+                            + เลือกวิชาที่ฉันสอน
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setEditingStudent({ ...editingStudent, AllowedCourses: (courses || []).map(c => c.CourseID).join(',') })}
+                          className="px-2 py-0.5 bg-indigo-100 hover:bg-indigo-200 text-indigo-800 rounded-lg text-[11px] font-bold transition"
+                        >
+                          เลือกทุกวิชา
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditingStudent({ ...editingStudent, AllowedCourses: 'NONE' })}
+                          className="px-2 py-0.5 bg-rose-100 hover:bg-rose-200 text-rose-700 rounded-lg text-[11px] font-bold transition"
+                        >
+                          ล้างทั้งหมด
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Selected Course Pills */}
+                    <div className="flex flex-wrap gap-1.5 min-h-[34px] p-2 bg-white rounded-xl border border-slate-200">
+                      {(() => {
+                        const selectedCourses = (courses || []).filter(c => isStudentEnrolledInCourse(editingStudent, c));
+                        if (selectedCourses.length === 0) {
+                          return <span className="text-xs text-slate-400 self-center px-1">ยังไม่ได้เลือกรายวิชา (คลิกช่องค้นหาด้านล่างเพื่อเพิ่มวิชา)</span>;
+                        }
+                        return selectedCourses.map(c => (
+                          <span
+                            key={c.CourseID}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-indigo-600 text-white rounded-xl text-xs font-bold shadow-sm"
+                          >
+                            <span className="font-mono bg-white/20 px-1.5 py-0.2 rounded text-[10px]">{c.CourseID}</span>
+                            <span>{c.Code} {c.Name}</span>
+                            <button
+                              type="button"
+                              onClick={() => setEditingStudent(buildStudentWithRemovedCourse(editingStudent, c, courses))}
+                              className="ml-0.5 hover:bg-white/20 rounded-full w-4 h-4 flex items-center justify-center font-black"
+                              title="เอาวิชานี้ออก"
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ));
+                      })()}
+                    </div>
+
+                    {/* Auto-Dropdown Search Input for Courses */}
+                    <div className="relative">
+                      <div className="flex items-center bg-white border border-slate-300 focus-within:border-indigo-500 rounded-xl px-3 py-2">
+                        <Icon name="Search" size={15} className="text-slate-400 mr-2 shrink-0" />
+                        <input
+                          type="text"
+                          value={courseDropdownQuery}
+                          onFocus={() => setIsCourseDropdownOpen(true)}
+                          onChange={(e) => {
+                            setCourseDropdownQuery(e.target.value);
+                            setIsCourseDropdownOpen(true);
+                          }}
+                          placeholder="คลิกหรือพิมพ์รหัส CourseID, รหัสวิชา, หรือชื่อวิชา เพื่อเลือก..."
+                          className="w-full text-xs bg-transparent focus:outline-none text-slate-700"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setIsCourseDropdownOpen(prev => !prev)}
+                          className="text-[11px] font-bold text-indigo-600 px-2 py-0.5 bg-indigo-50 rounded-lg shrink-0"
+                        >
+                          {isCourseDropdownOpen ? 'ซ่อนรายการ' : 'เลือกรายวิชา ▾'}
+                        </button>
+                      </div>
+
+                      {isCourseDropdownOpen && (
+                        <div className="mt-1.5 bg-white rounded-xl border border-slate-200 shadow-lg max-h-48 overflow-y-auto custom-scroll divide-y divide-slate-100">
+                          {(courses || [])
+                            .filter(c => {
+                              const q = courseDropdownQuery.trim().toLowerCase();
+                              if (!q) return true;
+                              return (
+                                String(c.CourseID || '').toLowerCase().includes(q) ||
+                                String(c.Code || '').toLowerCase().includes(q) ||
+                                String(c.Name || '').toLowerCase().includes(q) ||
+                                String(c.TeacherName || '').toLowerCase().includes(q)
+                              );
+                            })
+                            .map(c => {
+                              const isSelected = isStudentEnrolledInCourse(editingStudent, c);
+                              const isMine = currentUser?.role === 'teacher' && c.TeacherID === currentUser.user?.TeacherID;
+                              return (
+                                <button
+                                  key={c.CourseID}
+                                  type="button"
+                                  onClick={() => {
+                                    const next = isSelected
+                                      ? buildStudentWithRemovedCourse(editingStudent, c, courses)
+                                      : buildStudentWithAddedCourse(editingStudent, c);
+                                    setEditingStudent(next);
+                                  }}
+                                  className={`w-full px-3 py-2 text-left text-xs flex items-center justify-between gap-2 transition ${
+                                    isSelected ? 'bg-indigo-50/80 text-indigo-900 font-bold' : 'hover:bg-slate-50 text-slate-700'
+                                  }`}
+                                >
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="font-mono font-black px-1.5 py-0.5 bg-amber-100 text-amber-900 rounded text-[11px]">
+                                      {c.CourseID}
+                                    </span>
+                                    <span className="font-mono font-bold text-indigo-600">{c.Code}</span>
+                                    <span>{c.Name}</span>
+                                    {isMine && (
+                                      <span className="px-1.5 py-0.2 bg-emerald-100 text-emerald-800 rounded text-[10px] font-bold">
+                                        วิชาที่คุณสอน
+                                      </span>
+                                    )}
+                                  </div>
+                                  <span className={`px-2 py-0.5 rounded-lg text-[11px] font-bold shrink-0 ${
+                                    isSelected ? 'bg-rose-100 text-rose-700' : 'bg-emerald-600 text-white'
+                                  }`}>
+                                    {isSelected ? 'ลบออก ×' : '+ เลือก'}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Raw AllowedCourses display for transparency */}
+                    <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono pt-0.5">
+                      <span>ค่าที่บันทึก (AllowedCourses): {editingStudent.AllowedCourses || 'NONE'}</span>
+                    </div>
                   </div>
 
                   <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
