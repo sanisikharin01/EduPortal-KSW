@@ -53,6 +53,11 @@
   <!-- SweetAlert2 CDN -->
   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 
+  <!-- Firebase SDK (v10 Compat) & Realtime Database Service -->
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
+  <script src="firebase-service.js"></script>
+
   <style>
     body {
       font-family: 'Sarabun', 'Inter', sans-serif;
@@ -495,9 +500,53 @@
         }
       }, [gasUrl]);
 
-      // Auto-fetch database from GAS when URL is provided
+      // Helper to get active DriveFolderID from Settings
+      const activeDriveFolderId = useMemo(() => {
+        const item = db.Settings?.find(s => s.SettingKey === 'DriveFolderID');
+        if (item && item.SettingValueJSON) {
+          try { return JSON.parse(item.SettingValueJSON); } catch { return item.SettingValueJSON; }
+        }
+        return localStorage.getItem('eduportal_drive_folder_id') || '';
+      }, [db.Settings]);
+
+      // Initialize Firebase Realtime Database & Realtime Listeners on App Start
+      useEffect(() => {
+        let unsubscribe = null;
+        try {
+          if (window.FirebaseLMS) {
+            const ok = window.FirebaseLMS.init();
+            if (ok) {
+              console.log('[EduPortal] Firebase Realtime Database connected — listening for real-time updates');
+              unsubscribe = window.FirebaseLMS.subscribeAll((remoteData) => {
+                if (remoteData === null) {
+                  // หากฐานข้อมูล Firebase ยังว่างเปล่า ให้ Seed ข้อมูลเริ่มต้นเข้าไปอัตโนมัติ
+                  window.FirebaseLMS.seedDatabase(db).catch(err => console.warn('Auto-seed skipped:', err));
+                  return;
+                }
+                setDb(prev => {
+                  const next = { ...prev };
+                  Object.keys(remoteData).forEach(k => {
+                    if (Array.isArray(remoteData[k])) {
+                      next[k] = remoteData[k];
+                    }
+                  });
+                  return next;
+                });
+              });
+            }
+          }
+        } catch (e) {
+          console.warn('Firebase auto-init skipped:', e);
+        }
+        return () => {
+          if (typeof unsubscribe === 'function') unsubscribe();
+        };
+      }, []);
+
+      // Auto-fetch database from GAS ONLY if Firebase is not active
       useEffect(() => {
         const autoFetch = async () => {
+          if (window.FirebaseLMS && window.FirebaseLMS.isInitialized) return;
           if (!gasUrl || !gasUrl.startsWith('https://script.google.com/')) return;
           setIsSyncing(true);
           try {
@@ -656,7 +705,7 @@
         }
       };
 
-      // Generalized Record Saver with immediate Local Cache & remote sync
+      // Generalized Record Saver with immediate Local Cache & Firebase Realtime DB sync
       const saveRecordToSheet = async (sheetName, recordData) => {
         const idKey = ID_KEYS[sheetName] || 'ID';
         setDb(prev => {
@@ -672,18 +721,44 @@
           return { ...prev, [sheetName]: updated };
         });
 
+        // 1. บันทึกลง Firebase Realtime Database เป็นหลัก (ทำงานทันทีระดับมิลลิวินาที)
+        if (window.FirebaseLMS && window.FirebaseLMS.isInitialized) {
+          try {
+            setIsSyncing(true);
+            await window.FirebaseLMS.saveRecord(sheetName, recordData[idKey], recordData);
+          } catch (fbErr) {
+            console.error('[FirebaseLMS] saveRecord failed:', fbErr);
+          } finally {
+            setIsSyncing(false);
+          }
+          return;
+        }
+
+        // 2. Fallback ไปยัง Google Sheets กรณีไม่ได้เปิดใช้ Firebase
         if (gasUrl) {
           await callGasApi('saveRecord', { sheetName, data: recordData });
         }
       };
 
-      // Generalized Record Deleter
+      // Generalized Record Deleter (Firebase Realtime DB primary + Sheets fallback)
       const deleteRecordFromSheet = async (sheetName, primaryValue) => {
         const idKey = ID_KEYS[sheetName] || 'ID';
         setDb(prev => {
           const table = prev[sheetName] || [];
           return { ...prev, [sheetName]: table.filter(item => item[idKey] !== primaryValue) };
         });
+
+        if (window.FirebaseLMS && window.FirebaseLMS.isInitialized) {
+          try {
+            setIsSyncing(true);
+            await window.FirebaseLMS.deleteRecord(sheetName, primaryValue);
+          } catch (fbErr) {
+            console.error('[FirebaseLMS] deleteRecord failed:', fbErr);
+          } finally {
+            setIsSyncing(false);
+          }
+          return;
+        }
 
         if (gasUrl) {
           await callGasApi('deleteRecord', { sheetName, primaryValue });
@@ -722,15 +797,15 @@
                 </div>
                 <h1 className="text-2xl font-extrabold text-slate-900 tracking-tight">EduPortal LMS</h1>
                 <p className="text-slate-500 text-sm mt-1">ระบบจัดการเรียนการสอนออนไลน์สำหรับโรงเรียน</p>
-                <div className="inline-block mt-2 px-3 py-1 bg-indigo-50 text-indigo-700 text-xs font-semibold rounded-full">
-                  100% Free Serverless • Google Apps Script + Sheets
+                <div className="inline-block mt-2 px-3 py-1 bg-amber-50 text-amber-700 border border-amber-200 text-xs font-semibold rounded-full">
+                  🔥 Firebase Realtime Database + 📁 Google Drive Storage
                 </div>
               </div>
 
               <LoginForm db={db} onLogin={(role, user) => setCurrentUser({ role, user })} />
             </div>
             <p className="text-slate-400 text-xs mt-6 text-center">
-              EduPortal Online School Management • Powered by SANISIKHARIN ADMIN@KASEM & Gemini 4 Argon
+              EduPortal Online School Management • Powered by SANISIKHARIN ADMIN@KASEM
             </p>
           </div>
         );
@@ -744,7 +819,7 @@
             student={currentUser.user}
             onComplete={async (attemptData) => {
               await saveRecordToSheet('ExamAttempts', attemptData);
-              if (gasUrl) {
+              if (!(window.FirebaseLMS && window.FirebaseLMS.isInitialized) && gasUrl) {
                 await callGasApi('recordExamAttempt', { attempt: attemptData });
               }
               setTakingExam(null);
@@ -3875,18 +3950,51 @@
 
                   {/* Attachments / Learning Materials List Editor */}
                   <div className="space-y-2 pt-1">
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <label className="block text-xs font-bold text-slate-700">
                         สื่อการสอนและเอกสารประกอบ ({editingAttachments.length} รายการ)
                       </label>
-                      <button
-                        type="button"
-                        onClick={() => updateEditingAttachments([...editingAttachments, { title: 'ใบความรู้ประกอบการเรียน', url: 'https://' }])}
-                        className="px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-xs font-bold flex items-center gap-1"
-                      >
-                        <Icon name="Plus" size={13} />
-                        <span>เพิ่มลิงก์สื่อ/เอกสาร</span>
-                      </button>
+                      <div className="flex items-center gap-1.5">
+                        <label className="cursor-pointer px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-bold flex items-center gap-1 transition">
+                          <Icon name="UploadCloud" size={13} />
+                          <span>อัปโหลดไฟล์/ภาพขึ้น Drive</span>
+                          <input
+                            type="file"
+                            className="hidden"
+                            onChange={async (e) => {
+                              const file = e.target.files?.[0];
+                              if (!file) return;
+                              e.target.value = '';
+                              try {
+                                Swal.fire({
+                                  title: 'กำลังอัปโหลดไฟล์ไปที่ Google Drive...',
+                                  text: file.name,
+                                  allowOutsideClick: false,
+                                  didOpen: () => Swal.showLoading()
+                                });
+                                const res = await window.FirebaseLMS.uploadFileToDrive(file);
+                                if (res && res.fileUrl) {
+                                  updateEditingAttachments([
+                                    ...editingAttachments,
+                                    { title: file.name, url: res.fileUrl, driveFileId: res.driveFileId || '' }
+                                  ]);
+                                  Swal.fire({ icon: 'success', title: 'อัปโหลดเข้า Google Drive สำเร็จ!', timer: 1400, showConfirmButton: false });
+                                }
+                              } catch (err) {
+                                Swal.fire({ icon: 'error', title: 'อัปโหลดไม่สำเร็จ', text: err.message });
+                              }
+                            }}
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => updateEditingAttachments([...editingAttachments, { title: 'ใบความรู้ประกอบการเรียน', url: 'https://' }])}
+                          className="px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-xs font-bold flex items-center gap-1"
+                        >
+                          <Icon name="Plus" size={13} />
+                          <span>เพิ่มลิงก์สื่อ/เอกสาร</span>
+                        </button>
+                      </div>
                     </div>
 
                     {editingAttachments.map((att, idx) => (
@@ -4932,7 +5040,24 @@
             Status: 'Submitted'
           };
 
-          if (gasUrl) {
+          if (window.FirebaseLMS && window.FirebaseLMS.isInitialized) {
+            // โหมด Firebase Realtime DB: อัปโหลดเฉพาะไฟล์ไปฝากที่ Google Drive ID แล้วบันทึกข้อมูลลง Firebase
+            if (fileData && gasUrl) {
+              const folderId = window.FirebaseLMS.driveFolderId || localStorage.getItem('eduportal_drive_folder_id') || '';
+              const uploadRes = await callGasApi('uploadFile', {
+                base64Data: fileData.base64,
+                fileName: fileData.name,
+                mimeType: fileData.mimeType,
+                folderId: folderId
+              });
+              if (uploadRes && uploadRes.fileUrl) {
+                submissionPayload.FileUrl = uploadRes.fileUrl;
+                submissionPayload.DriveFileID = uploadRes.driveFileId || '';
+              }
+            } else if (uploadFile) {
+              submissionPayload.FileUrl = 'https://placehold.co/800x600/e0e7ff/4f46e5?text=' + encodeURIComponent(uploadFile.name);
+            }
+          } else if (gasUrl) {
             const res = await callGasApi('submitAssignment', {
               submission: submissionPayload,
               fileData: fileData
@@ -4952,7 +5077,7 @@
             }
           }
 
-          onSaveSubmission(submissionPayload);
+          await onSaveSubmission(submissionPayload);
           setSubmittingAssignId(null);
           setUploadFile(null);
           setStudentNote('');
@@ -4960,7 +5085,7 @@
           Swal.fire({
             icon: 'success',
             title: 'ส่งงานเรียบร้อยแล้ว!',
-            text: 'ไฟล์ของคุณถูกบันทึกเข้า Google Drive และตารางเรียบร้อย',
+            text: 'ไฟล์งานถูกฝากไว้ที่ Google Drive และบันทึกข้อมูลลง Firebase Realtime Database เรียบร้อย',
             confirmButtonColor: '#4f46e5'
           });
         } catch (error) {
@@ -5062,6 +5187,28 @@
                         <p className="text-slate-600 text-sm mt-2 whitespace-pre-line leading-relaxed">
                           {assign.Description}
                         </p>
+
+                        {(() => {
+                          let assignAtts = [];
+                          try { assignAtts = JSON.parse(assign.AttachmentsJSON || '[]'); } catch { assignAtts = []; }
+                          if (!Array.isArray(assignAtts) || assignAtts.length === 0) return null;
+                          return (
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              {assignAtts.map((att, i) => (
+                                <a
+                                  key={i}
+                                  href={att.url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-xl text-xs font-bold transition"
+                                >
+                                  <Icon name="ExternalLink" size={13} />
+                                  <span>{att.title || 'ไฟล์แนบใบงาน'}</span>
+                                </a>
+                              ))}
+                            </div>
+                          );
+                        })()}
                       </div>
 
                       {currentUser.role !== 'student' ? (
@@ -5277,6 +5424,70 @@
                         className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-500"
                       />
                     </div>
+                  </div>
+
+                  {/* แนบไฟล์ใบงาน / รูปภาพโจทย์ ฝากไว้ที่ Google Drive ID */}
+                  <div className="space-y-2 pt-1">
+                    <div className="flex items-center justify-between">
+                      <label className="block text-xs font-bold text-slate-700">ไฟล์ใบงาน / รูปภาพประกอบ</label>
+                      <label className="cursor-pointer px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-bold flex items-center gap-1 transition">
+                        <Icon name="UploadCloud" size={13} />
+                        <span>อัปโหลดไฟล์/ภาพขึ้น Google Drive</span>
+                        <input
+                          type="file"
+                          className="hidden"
+                          onChange={async (e) => {
+                            const file = e.target.files?.[0];
+                            if (!file) return;
+                            e.target.value = '';
+                            try {
+                              Swal.fire({
+                                title: 'กำลังอัปโหลดไฟล์ไปที่ Google Drive...',
+                                text: file.name,
+                                allowOutsideClick: false,
+                                didOpen: () => Swal.showLoading()
+                              });
+                              const res = await window.FirebaseLMS.uploadFileToDrive(file);
+                              if (res && res.fileUrl) {
+                                let cur = [];
+                                try { cur = JSON.parse(editingAssignment.AttachmentsJSON || '[]'); } catch { cur = []; }
+                                const next = [...cur, { title: file.name, url: res.fileUrl, driveFileId: res.driveFileId || '' }];
+                                setEditingAssignment(prev => ({ ...prev, AttachmentsJSON: JSON.stringify(next) }));
+                                Swal.fire({ icon: 'success', title: 'อัปโหลดเข้า Google Drive สำเร็จ!', timer: 1400, showConfirmButton: false });
+                              }
+                            } catch (err) {
+                              Swal.fire({ icon: 'error', title: 'อัปโหลดไม่สำเร็จ', text: err.message });
+                            }
+                          }}
+                        />
+                      </label>
+                    </div>
+                    {(() => {
+                      let cur = [];
+                      try { cur = JSON.parse(editingAssignment.AttachmentsJSON || '[]'); } catch { cur = []; }
+                      if (!Array.isArray(cur) || cur.length === 0) return null;
+                      return (
+                        <div className="space-y-1.5">
+                          {cur.map((att, idx) => (
+                            <div key={idx} className="flex items-center justify-between bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-200 text-xs">
+                              <a href={att.url} target="_blank" rel="noreferrer" className="text-indigo-600 font-semibold hover:underline truncate max-w-[80%]">
+                                {att.title}
+                              </a>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const next = cur.filter((_, i) => i !== idx);
+                                  setEditingAssignment(prev => ({ ...prev, AttachmentsJSON: JSON.stringify(next) }));
+                                }}
+                                className="text-rose-500 hover:bg-rose-50 p-1 rounded"
+                              >
+                                <Icon name="Trash2" size={13} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })()}
                   </div>
 
                   <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
@@ -6805,11 +7016,11 @@
           SubmittedAt: new Date().toLocaleString('th-TH')
         };
 
-        if (gasUrl) {
+        if (!(window.FirebaseLMS && window.FirebaseLMS.isInitialized) && gasUrl) {
           await callGasApi('submitEvaluation', { evaluation: evalRecord });
         }
 
-        onSaveEvaluation(evalRecord);
+        await onSaveEvaluation(evalRecord);
         setIsSubmitting(false);
 
         Swal.fire({
@@ -7135,7 +7346,9 @@
           const chunk = parsedRecords.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
           setImportStatusText(`กำลังส่งข้อมูลชุดที่ ${i + 1} จาก ${totalChunks} (${chunk.length} คน)...`);
 
-          if (gasUrl) {
+          if (window.FirebaseLMS && window.FirebaseLMS.isInitialized) {
+            await window.FirebaseLMS.batchSaveRecords('Students', chunk, 'StudentID');
+          } else if (gasUrl) {
             await callGasApi('batchSave', { sheetName: 'Students', records: chunk });
           }
 
@@ -7884,9 +8097,158 @@
         return 'admin1234';
       });
 
+      const [firebaseConfigInput, setFirebaseConfigInput] = useState(() => {
+        const saved = localStorage.getItem('eduportal_firebase_config');
+        if (saved) return saved;
+        // ค่าเริ่มต้นจากโปรเจกต์ของคุณ
+        return JSON.stringify({
+          apiKey: "AIzaSyBpxLrxZCHFJF9oF7NLZPyJ97FepNpgcKs",
+          authDomain: "eduportal-eaf18.firebaseapp.com",
+          databaseURL: "https://eduportal-eaf18-default-rtdb.asia-southeast1.firebasedatabase.app",
+          projectId: "eduportal-eaf18",
+          storageBucket: "eduportal-eaf18.firebasestorage.app",
+          messagingSenderId: "872982218216",
+          appId: "1:872982218216:web:ab314897ce0fcf1854d05d",
+          measurementId: "G-PJRZZ6STC5"
+        }, null, 2);
+      });
+
+      // ฟังก์ชันช่วยแปลง input ข้อความให้เป็น Object Config อย่างยืดหยุ่น (รองรับทั้ง JSON และ JS Object)
+      const parseFirebaseInput = (inputStr) => {
+        const raw = String(inputStr || '').trim();
+        if (!raw) return null;
+        try {
+          return JSON.parse(raw);
+        } catch (e) {
+          // หากผู้ใช้วางแบบ JS Object เช่น const firebaseConfig = { apiKey: "..." }
+          const match = raw.match(/\{[\s\S]*\}/);
+          if (match) {
+            try {
+              // แปลง JavaScript object literal syntax ให้เป็น JSON
+              const jsonLike = match[0]
+                .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '"$2": ')
+                .replace(/'/g, '"')
+                .replace(/,\s*([}\]])/g, '$1');
+              return JSON.parse(jsonLike);
+            } catch (err2) {
+              // fallback ใช้ Function constructor อย่างปลอดภัยกับ object
+              return (new Function('return ' + match[0]))();
+            }
+          }
+          throw new Error('ไม่พบข้อมูลรูปแบบ Object ในข้อความที่วาง');
+        }
+      };
+
+      const handleTestFirebase = async () => {
+        try {
+          if (!firebaseConfigInput.trim()) {
+            Swal.fire({
+              icon: 'warning',
+              title: 'กรุณาระบุ Firebase Config',
+              text: 'นำโค้ด JSON Config จาก Firebase Console (Project Settings) มาวางที่นี่',
+              confirmButtonColor: '#4f46e5'
+            });
+            return;
+          }
+
+          let cfg;
+          try {
+            cfg = parseFirebaseInput(firebaseConfigInput);
+          } catch (e) {
+            throw new Error('รูปแบบ Firebase Config ไม่ถูกต้อง: ' + e.message);
+          }
+
+          const initialized = window.FirebaseLMS.saveConfig(cfg, urlInput.trim(), folderIdInput.trim());
+          if (!initialized) {
+            throw new Error('ไม่สามารถเชื่อมต่อ Firebase ได้ ตรวจสอบ apiKey และ databaseURL');
+          }
+
+          // ทดสอบอ่านข้อมูล
+          await window.FirebaseLMS.db.ref('eduportal/_ping').set({
+            status: 'online',
+            timestamp: firebase.database.ServerValue.TIMESTAMP
+          });
+
+          Swal.fire({
+            icon: 'success',
+            title: 'เชื่อมต่อ Firebase สำเร็จ!',
+            text: 'ระบบ Realtime Database พร้อมใช้งานแล้ว',
+            confirmButtonColor: '#10b981'
+          });
+        } catch (err) {
+          Swal.fire({
+            icon: 'error',
+            title: 'เชื่อมต่อ Firebase ล้มเหลว',
+            text: err.message,
+            confirmButtonColor: '#ef4444'
+          });
+        }
+      };
+
+      const handleMigrateSheetToFirebase = async () => {
+        const confirm = await Swal.fire({
+          title: 'ยืนยันการย้ายข้อมูลสู่ Firebase?',
+          text: 'ระบบจะนำข้อมูลทั้งหมดปัจจุบัน (ทั้ง 10 ตาราง) อัปโหลดขึ้นสู่ Firebase Realtime Database ทันที',
+          icon: 'question',
+          showCancelButton: true,
+          confirmButtonColor: '#4f46e5',
+          cancelButtonColor: '#64748b',
+          confirmButtonText: 'เริ่มการย้ายข้อมูล',
+          cancelButtonText: 'ยกเลิก'
+        });
+
+        if (!confirm.isConfirmed) return;
+
+        try {
+          if (!window.FirebaseLMS.isInitialized) {
+            let cfg = null;
+            if (firebaseConfigInput.trim()) {
+              cfg = parseFirebaseInput(firebaseConfigInput.trim());
+              window.FirebaseLMS.saveConfig(cfg, urlInput.trim(), folderIdInput.trim());
+            }
+            if (!window.FirebaseLMS.isInitialized) {
+              throw new Error('โปรดบันทึกและเชื่อมต่อ Firebase ให้สำเร็จก่อนทำการย้ายข้อมูล');
+            }
+          }
+
+          Swal.fire({
+            title: 'กำลังย้ายข้อมูล...',
+            text: 'กำลังส่งข้อมูลทั้งหมดขึ้น Firebase Realtime Database',
+            allowOutsideClick: false,
+            didOpen: () => Swal.showLoading()
+          });
+
+          const currentDb = JSON.parse(localStorage.getItem('eduportal_db_cache') || '{}');
+          await window.FirebaseLMS.seedDatabase(currentDb);
+
+          Swal.fire({
+            icon: 'success',
+            title: 'ย้ายข้อมูลสำเร็จ!',
+            text: 'ข้อมูลทั้งหมดถูกบันทึกขึ้น Firebase Realtime Database เรียบร้อยแล้ว',
+            confirmButtonColor: '#10b981'
+          });
+        } catch (err) {
+          Swal.fire({
+            icon: 'error',
+            title: 'การย้ายข้อมูลล้มเหลว',
+            text: err.message,
+            confirmButtonColor: '#ef4444'
+          });
+        }
+      };
+
       const handleSaveGeneral = (e) => {
         e.preventDefault();
         setGasUrl(urlInput.trim());
+
+        if (firebaseConfigInput.trim()) {
+          try {
+            const parsedConfig = parseFirebaseInput(firebaseConfigInput.trim());
+            window.FirebaseLMS.saveConfig(parsedConfig, urlInput.trim(), folderIdInput.trim());
+          } catch (err) {
+            console.warn('Firebase config input parse error:', err);
+          }
+        }
 
         onSaveSetting({
           SettingKey: 'DriveFolderID',
@@ -8008,6 +8370,45 @@
                   placeholder="เช่น 1A2b3C4d5E... (หากเว้นว่าง ระบบจะสร้างโฟลเดอร์ EduPortal_Submissions ให้อัตโนมัติ)"
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono focus:outline-none focus:border-indigo-500"
                 />
+              </div>
+
+              {/* Firebase Realtime Database Section */}
+              <div className="p-4 bg-amber-50/60 rounded-2xl border border-amber-200/80 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="p-1.5 bg-amber-500 text-white rounded-lg text-xs font-black">🔥 Firebase</span>
+                    <span className="text-xs font-bold text-slate-800">Firebase Realtime Database Configuration</span>
+                  </div>
+                  <span className="text-[10px] bg-amber-200 text-amber-900 px-2 py-0.5 rounded-full font-bold">เวอร์ชัน Realtime</span>
+                </div>
+                <p className="text-[11px] text-slate-600">
+                  วางชุด Firebase Config (JSON) จาก Firebase Console &gt; Project Settings &gt; General &gt; Your Apps
+                </p>
+                <textarea
+                  rows="4"
+                  value={firebaseConfigInput}
+                  onChange={(e) => setFirebaseConfigInput(e.target.value)}
+                  placeholder='{"apiKey": "AIza...", "authDomain": "...", "databaseURL": "https://...firebasedatabase.app", "projectId": "..."}'
+                  className="w-full p-2.5 bg-white border border-amber-200 rounded-xl text-xs font-mono focus:outline-none focus:border-amber-500"
+                />
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleTestFirebase}
+                    className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs rounded-xl shadow-sm transition flex items-center gap-1.5"
+                  >
+                    <Icon name="RefreshCw" size={14} />
+                    <span>ทดสอบเชื่อมต่อ Firebase</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleMigrateSheetToFirebase}
+                    className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl shadow-sm transition flex items-center gap-1.5"
+                  >
+                    <Icon name="UploadCloud" size={14} />
+                    <span>ย้ายข้อมูลจาก Sheet ขึ้น Firebase (Migrate)</span>
+                  </button>
+                </div>
               </div>
 
               <div>
