@@ -662,6 +662,9 @@
       const [takingExam, setTakingExam] = useState(null);
       const [showAnnouncement, setShowAnnouncement] = useState(false);
       const [showMobileProfile, setShowMobileProfile] = useState(false);
+      const [showPdpaModal, setShowPdpaModal] = useState(false);
+      const [showVoluntaryPinModal, setShowVoluntaryPinModal] = useState(false);
+      const [loginPdpaConsent, setLoginPdpaConsent] = useState(false);
 
       const currentAnnouncement = useMemo(() => {
         const item = db.Settings?.find(s => s.SettingKey === 'Announcement');
@@ -855,28 +858,138 @@
         return (db.Courses || []).find(c => c.CourseID === selectedCourseId) || null;
       }, [db.Courses, selectedCourseId]);
 
+      // Live user record from db (updates immediately when PIN/Password is changed)
+      const liveUserRecord = useMemo(() => {
+        if (!currentUser) return null;
+        if (currentUser.role === 'student') {
+          return (db.Students || []).find(s => isSameStudentId(s.StudentID, currentUser.user?.StudentID)) || currentUser.user;
+        }
+        if (currentUser.role === 'teacher') {
+          return (db.Teachers || []).find(t =>
+            t.TeacherID === currentUser.user?.TeacherID ||
+            (t.Email && currentUser.user?.Email && t.Email.toLowerCase() === currentUser.user.Email.toLowerCase())
+          ) || currentUser.user;
+        }
+        return currentUser.user;
+      }, [currentUser, db.Students, db.Teachers]);
+
+      // Check if Student or Teacher is logging in for the first time (still using default PIN/Password)
+      const mustChangePinOnFirstLogin = useMemo(() => {
+        if (!currentUser || !liveUserRecord) return false;
+        if (currentUser.role === 'student') {
+          const curPin = String(liveUserRecord.PIN || '1234').trim();
+          return curPin === '1234' || String(liveUserRecord.PinChanged || '') === 'false';
+        }
+        if (currentUser.role === 'teacher') {
+          const curPass = String(liveUserRecord.Password || '123').trim();
+          return (curPass === '123' || curPass === '1234') || String(liveUserRecord.PasswordChanged || '') === 'false';
+        }
+        return false;
+      }, [currentUser, liveUserRecord]);
+
+      const handleUpdatePersonalCredential = async (newSecret) => {
+        if (!currentUser || !liveUserRecord) return;
+        const nowIso = new Date().toISOString();
+        if (currentUser.role === 'student') {
+          const updatedStudent = {
+            ...liveUserRecord,
+            PIN: String(newSecret).trim(),
+            PinChanged: 'true',
+            PinChangedAt: nowIso,
+            PdpaConsentAt: liveUserRecord.PdpaConsentAt || nowIso
+          };
+          await saveRecordToSheet('Students', updatedStudent);
+          setCurrentUser({ role: 'student', user: updatedStudent });
+        } else if (currentUser.role === 'teacher') {
+          const updatedTeacher = {
+            ...liveUserRecord,
+            Password: String(newSecret).trim(),
+            PasswordChanged: 'true',
+            PasswordChangedAt: nowIso,
+            PdpaConsentAt: liveUserRecord.PdpaConsentAt || nowIso
+          };
+          await saveRecordToSheet('Teachers', updatedTeacher);
+          setCurrentUser({ role: 'teacher', user: updatedTeacher });
+        }
+      };
+
       // Check if user is logged in
       if (!currentUser) {
         return (
           <div className="min-h-screen bg-gradient-to-br from-indigo-950 via-slate-900 to-slate-950 flex flex-col items-center justify-center p-4">
-            <div className="w-full max-w-md bg-white rounded-3xl shadow-2xl p-8 border border-slate-100">
-              <div className="text-center mb-8">
-                <div className="w-16 h-16 bg-gradient-to-tr from-indigo-600 to-brand-500 rounded-2xl flex items-center justify-center text-white mx-auto shadow-lg shadow-indigo-500/30 mb-4">
+            <div className="w-full max-w-md bg-white rounded-3xl shadow-2xl p-6 sm:p-8 border border-slate-100">
+              <div className="text-center mb-6">
+                <div className="w-16 h-16 bg-gradient-to-tr from-indigo-600 to-brand-500 rounded-2xl flex items-center justify-center text-white mx-auto shadow-lg shadow-indigo-500/30 mb-3">
                   <Icon name="GraduationCap" size={36} />
                 </div>
                 <h1 className="text-2xl font-extrabold text-slate-900 tracking-tight">EduPortal LMS</h1>
                 <p className="text-slate-500 text-sm mt-1">ระบบจัดการเรียนการสอนออนไลน์สำหรับโรงเรียน</p>
-                <div className="inline-block mt-2 px-3 py-1 bg-amber-50 text-amber-700 border border-amber-200 text-xs font-semibold rounded-full">
-                  🔥 Firebase Realtime Database + 📁 Google Drive Storage
+                <div className="flex flex-wrap items-center justify-center gap-1.5 mt-2.5">
+                  <span className="px-2.5 py-1 bg-amber-50 text-amber-700 border border-amber-200 text-[11px] font-semibold rounded-full">
+                    🔥 Firebase Realtime + 📁 Google Drive
+                  </span>
+                  <span className="px-2.5 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-bold rounded-full flex items-center gap-1">
+                    <Icon name="Shield" size={12} />
+                    <span>คุ้มครองข้อมูลส่วนบุคคล PDPA</span>
+                  </span>
                 </div>
               </div>
 
-              <LoginForm db={db} onLogin={(role, user) => setCurrentUser({ role, user })} />
+              <LoginForm
+                db={db}
+                onLogin={(role, user) => setCurrentUser({ role, user })}
+                onOpenPdpaPolicy={() => setShowPdpaModal(true)}
+                pdpaConsent={loginPdpaConsent}
+                setPdpaConsent={setLoginPdpaConsent}
+              />
             </div>
-            <p className="text-slate-400 text-xs mt-6 text-center">
-              EduPortal Online School Management • Powered by SANISIKHARIN ADMIN@KASEM
-            </p>
+
+            <div className="mt-5 text-center space-y-1.5">
+              <button
+                type="button"
+                onClick={() => setShowPdpaModal(true)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-white/10 hover:bg-white/20 text-emerald-300 border border-emerald-400/30 rounded-full text-xs font-bold transition"
+              >
+                <Icon name="Shield" size={14} />
+                <span>เว็บไซต์นี้มีการคุ้มครองข้อมูลส่วนบุคคล PDPA • คลิกอ่านนโยบาย & สิทธิ์ RBAC</span>
+              </button>
+              <p className="text-slate-400 text-xs">
+                EduPortal Online School Management • Powered by SANISIKHARIN ADMIN@KASEM
+              </p>
+            </div>
+
+            {showPdpaModal && (
+              <PdpaAndRbacModal
+                onClose={() => setShowPdpaModal(false)}
+                onAcceptConsent={() => {
+                  setLoginPdpaConsent(true);
+                  setShowPdpaModal(false);
+                }}
+              />
+            )}
           </div>
+        );
+      }
+
+      // Force First-Login PIN / Password Change Screen for Students and Teachers
+      if (mustChangePinOnFirstLogin) {
+        return (
+          <>
+            <ForceChangePinScreen
+              currentUser={currentUser}
+              liveUser={liveUserRecord}
+              isVoluntary={false}
+              onSaveNewCredential={handleUpdatePersonalCredential}
+              onOpenPdpaPolicy={() => setShowPdpaModal(true)}
+              onLogout={() => {
+                setCurrentUser(null);
+                sessionStorage.removeItem('eduportal_seen_announcement');
+              }}
+            />
+            {showPdpaModal && (
+              <PdpaAndRbacModal onClose={() => setShowPdpaModal(false)} />
+            )}
+          </>
         );
       }
 
@@ -926,6 +1039,8 @@
             isSyncing={isSyncing}
             onRefresh={handlePullData}
             onOpenProfile={() => setShowMobileProfile(true)}
+            onOpenPdpa={() => setShowPdpaModal(true)}
+            onOpenChangePin={() => setShowVoluntaryPinModal(true)}
             setCurrentTab={(tab) => { setSelectedCourseId(null); setCurrentTab(tab); }} 
             onLogout={() => {
               Swal.fire({
@@ -945,6 +1060,30 @@
             }}
           />
 
+          {/* PDPA & RBAC Modal (Accessible anytime after login) */}
+          {showPdpaModal && (
+            <PdpaAndRbacModal onClose={() => setShowPdpaModal(false)} />
+          )}
+
+          {/* Voluntary PIN/Password Change Modal */}
+          {showVoluntaryPinModal && (currentUser.role === 'student' || currentUser.role === 'teacher') && (
+            <ForceChangePinScreen
+              currentUser={currentUser}
+              liveUser={liveUserRecord}
+              isVoluntary={true}
+              onClose={() => setShowVoluntaryPinModal(false)}
+              onSaveNewCredential={async (newSecret) => {
+                await handleUpdatePersonalCredential(newSecret);
+                setShowVoluntaryPinModal(false);
+              }}
+              onOpenPdpaPolicy={() => setShowPdpaModal(true)}
+              onLogout={() => {
+                setCurrentUser(null);
+                setShowVoluntaryPinModal(false);
+              }}
+            />
+          )}
+
           {/* Announcement Popup Modal (If Active and Not Dismissed) */}
           {showAnnouncement && currentAnnouncement && (
             <AnnouncementModal announcement={currentAnnouncement} onClose={() => setShowAnnouncement(false)} />
@@ -957,6 +1096,8 @@
               onClose={() => setShowMobileProfile(false)}
               onShowAnnouncement={() => { setShowMobileProfile(false); setShowAnnouncement(true); }}
               onRefresh={() => { setShowMobileProfile(false); handlePullData(); }}
+              onOpenPdpa={() => { setShowMobileProfile(false); setShowPdpaModal(true); }}
+              onOpenChangePin={() => { setShowMobileProfile(false); setShowVoluntaryPinModal(true); }}
               onLogout={() => {
                 setShowMobileProfile(false);
                 Swal.fire({
@@ -1092,7 +1233,7 @@
     }
 
     // --- Navigation Header Component ---
-    function Navbar({ currentUser, currentTab, isSyncing, onRefresh, onOpenProfile, setCurrentTab, onLogout }) {
+    function Navbar({ currentUser, currentTab, isSyncing, onRefresh, onOpenProfile, onOpenPdpa, onOpenChangePin, setCurrentTab, onLogout }) {
       const getRoleBadge = (role) => {
         if (role === 'admin') return <span className="bg-rose-100 text-rose-700 font-semibold px-2.5 py-0.5 rounded-full text-[11px]">ผู้ดูแลระบบ</span>;
         if (role === 'teacher') return <span className="bg-amber-100 text-amber-700 font-semibold px-2.5 py-0.5 rounded-full text-[11px]">ครูผู้สอน</span>;
@@ -1148,7 +1289,31 @@
               </div>
 
               {/* Right Side User Info & Quick Actions */}
-              <div className="flex items-center gap-2 sm:gap-3">
+              <div className="flex items-center gap-1.5 sm:gap-2.5">
+                {/* PDPA & RBAC Policy Button */}
+                {onOpenPdpa && (
+                  <button
+                    onClick={onOpenPdpa}
+                    title="นโยบายคุ้มครองข้อมูลส่วนบุคคล (PDPA) & สิทธิ์การใช้งาน (RBAC)"
+                    className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold text-xs rounded-xl border border-emerald-200/80 transition active:scale-95"
+                  >
+                    <Icon name="Shield" size={15} />
+                    <span className="hidden lg:inline">PDPA & RBAC</span>
+                  </button>
+                )}
+
+                {/* Change PIN / Password Button for Student & Teacher */}
+                {onOpenChangePin && (currentUser.role === 'student' || currentUser.role === 'teacher') && (
+                  <button
+                    onClick={onOpenChangePin}
+                    title="เปลี่ยนรหัส PIN / รหัสผ่านส่วนตัว"
+                    className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 font-bold text-xs rounded-xl border border-amber-200/80 transition active:scale-95"
+                  >
+                    <Icon name="Key" size={15} />
+                    <span className="hidden lg:inline">เปลี่ยนรหัส</span>
+                  </button>
+                )}
+
                 {/* Quick Sync Button on Mobile & Desktop */}
                 <button
                   onClick={onRefresh}
@@ -1321,7 +1486,7 @@
     }
 
     // --- Mobile User Profile & Quick Action Sheet ---
-    function MobileProfileModal({ currentUser, onClose, onShowAnnouncement, onRefresh, onLogout }) {
+    function MobileProfileModal({ currentUser, onClose, onShowAnnouncement, onRefresh, onOpenPdpa, onOpenChangePin, onLogout }) {
       const roleLabel = currentUser.role === 'admin' ? 'ผู้ดูแลระบบ (Admin)' : currentUser.role === 'teacher' ? 'ครูผู้สอน (Teacher)' : 'นักเรียน (Student)';
       const roleColor = currentUser.role === 'admin' ? 'bg-rose-100 text-rose-700' : currentUser.role === 'teacher' ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700';
 
@@ -1385,6 +1550,24 @@
                 <Icon name="Bell" size={16} />
                 <span>ดูป๊อปอัปประกาศ</span>
               </button>
+              {onOpenPdpa && (
+                <button
+                  onClick={onOpenPdpa}
+                  className="flex items-center justify-center gap-2 p-3.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold text-xs rounded-2xl border border-emerald-100 transition active:scale-95"
+                >
+                  <Icon name="Shield" size={16} />
+                  <span>PDPA & RBAC</span>
+                </button>
+              )}
+              {onOpenChangePin && (currentUser.role === 'student' || currentUser.role === 'teacher') && (
+                <button
+                  onClick={onOpenChangePin}
+                  className="flex items-center justify-center gap-2 p-3.5 bg-violet-50 hover:bg-violet-100 text-violet-700 font-bold text-xs rounded-2xl border border-violet-100 transition active:scale-95"
+                >
+                  <Icon name="Key" size={16} />
+                  <span>เปลี่ยนรหัสส่วนตัว</span>
+                </button>
+              )}
             </div>
 
             <button
@@ -1592,8 +1775,8 @@
       );
     }
 
-    // --- Tabbed Login Form (Mobile Friendly with Show/Hide Password & Numeric Keypad) ---
-    function LoginForm({ db, onLogin }) {
+    // --- Tabbed Login Form (Mobile Friendly with Show/Hide Password & Numeric Keypad + PDPA Consent) ---
+    function LoginForm({ db, onLogin, onOpenPdpaPolicy, pdpaConsent: externalConsent, setPdpaConsent: setExternalConsent }) {
       const [role, setRole] = useState('student');
       const [studentId, setStudentId] = useState('');
       const [pin, setPin] = useState('');
@@ -1601,9 +1784,30 @@
       const [teacherPassword, setTeacherPassword] = useState('');
       const [adminPassword, setAdminPassword] = useState('');
       const [showPass, setShowPass] = useState(false);
+      const [localConsent, setLocalConsent] = useState(false);
+
+      const pdpaConsent = externalConsent !== undefined ? externalConsent : localConsent;
+      const setPdpaConsent = setExternalConsent || setLocalConsent;
 
       const handleLoginSubmit = (e) => {
         e.preventDefault();
+
+        if (!pdpaConsent) {
+          Swal.fire({
+            icon: 'warning',
+            title: 'กรุณายืนยันความยินยอม PDPA',
+            html: 'โปรดทำเครื่องหมายถูก <b>"ข้าพเจ้ารับทราบและยินยอมตามนโยบายคุ้มครองข้อมูลส่วนบุคคล (PDPA)"</b> ก่อนกดเข้าสู่ระบบ',
+            showCancelButton: true,
+            confirmButtonText: 'อ่านนโยบาย PDPA & RBAC',
+            cancelButtonText: 'ปิดหน้าต่าง',
+            confirmButtonColor: '#059669'
+          }).then((res) => {
+            if (res.isConfirmed && onOpenPdpaPolicy) {
+              onOpenPdpaPolicy();
+            }
+          });
+          return;
+        }
 
         if (role === 'student') {
           const cleanId = studentId.trim();
@@ -1810,14 +2014,14 @@
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1.5">รหัสผ่าน (Password)</label>
+                  <label className="block text-xs font-bold text-slate-700 mb-1.5">รหัสผ่าน / PIN ครูผู้สอน</label>
                   <div className="relative">
                     <input
                       type={showPass ? "text" : "password"}
                       required
                       value={teacherPassword}
                       onChange={(e) => setTeacherPassword(e.target.value)}
-                      placeholder="รหัสผ่านเข้าใช้งาน"
+                      placeholder="รหัสผ่านเข้าใช้งาน (เริ่มต้น 123)"
                       className="w-full pl-4 pr-11 py-3 bg-slate-50 border border-slate-200 rounded-2xl text-base sm:text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition"
                     />
                     <button
@@ -1886,13 +2090,578 @@
               </>
             )}
 
+            {/* PDPA Notice & Mandatory Consent Checkbox Box */}
+            <div className={`p-3.5 rounded-2xl border transition ${
+              pdpaConsent
+                ? 'bg-emerald-50/70 border-emerald-200'
+                : 'bg-slate-50 border-slate-200/90 hover:border-indigo-300'
+            }`}>
+              <div className="flex items-start gap-2.5">
+                <input
+                  id="pdpa-consent-checkbox"
+                  type="checkbox"
+                  checked={pdpaConsent}
+                  onChange={(e) => setPdpaConsent(e.target.checked)}
+                  className="mt-0.5 w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer shrink-0"
+                />
+                <div className="text-xs leading-relaxed text-slate-600">
+                  <label htmlFor="pdpa-consent-checkbox" className="font-bold text-slate-800 cursor-pointer select-none">
+                    ข้าพเจ้ารับทราบและยินยอมตามนโยบายคุ้มครองข้อมูลส่วนบุคคล (Privacy Policy / Consent)
+                  </label>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    เว็บไซต์นี้มีการคุ้มครองข้อมูลส่วนบุคคลตาม พ.ร.บ. คุ้มครองข้อมูลส่วนบุคคล (PDPA) และจำกัดสิทธิ์การเข้าถึงข้อมูลตามบทบาท (RBAC)
+                  </p>
+                  {onOpenPdpaPolicy && (
+                    <button
+                      type="button"
+                      onClick={onOpenPdpaPolicy}
+                      className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-extrabold text-indigo-600 hover:text-indigo-800 underline underline-offset-2"
+                    >
+                      <Icon name="Shield" size={12} />
+                      <span>อ่านรายละเอียด Privacy Policy (PDPA) & สิทธิ์ RBAC</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
             <button
               type="submit"
-              className="w-full py-3.5 bg-gradient-to-r from-indigo-600 to-brand-600 hover:from-indigo-700 hover:to-brand-700 text-white font-extrabold text-sm rounded-2xl shadow-lg shadow-indigo-600/30 transition transform active:scale-[0.98] mt-2"
+              className={`w-full py-3.5 font-extrabold text-sm rounded-2xl shadow-lg transition transform active:scale-[0.98] mt-1 flex items-center justify-center gap-2 ${
+                pdpaConsent
+                  ? 'bg-gradient-to-r from-indigo-600 to-brand-600 hover:from-indigo-700 hover:to-brand-700 text-white shadow-indigo-600/30'
+                  : 'bg-slate-200 hover:bg-slate-300 text-slate-500 shadow-none'
+              }`}
             >
-              เข้าสู่ระบบ EduPortal
+              <Icon name={pdpaConsent ? "Lock" : "Shield"} size={16} />
+              <span>{pdpaConsent ? 'เข้าสู่ระบบ EduPortal' : 'กรุณาทำเครื่องหมายยอมรับ PDPA ก่อนเข้าสู่ระบบ'}</span>
             </button>
           </form>
+        </div>
+      );
+    }
+
+    // --- Privacy Policy / Consent (PDPA) & Role-Based Access Control (RBAC) Modal ---
+    function PdpaAndRbacModal({ onClose, onAcceptConsent }) {
+      const [activeTab, setActiveTab] = useState('pdpa');
+
+      return (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/70 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+          <div
+            className="bg-white rounded-t-3xl sm:rounded-3xl max-w-3xl w-full max-h-[90vh] flex flex-col shadow-2xl border-t sm:border border-slate-100 overflow-hidden bottom-sheet"
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="px-6 py-4 bg-gradient-to-r from-emerald-700 via-teal-700 to-indigo-800 text-white flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 rounded-2xl bg-white/15 backdrop-blur flex items-center justify-center text-emerald-200 border border-white/20">
+                  <Icon name="Shield" size={24} />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-0.5 bg-emerald-400/20 border border-emerald-300/40 rounded-full text-[10px] font-extrabold uppercase tracking-wider text-emerald-100">
+                      PDPA & RBAC Security Standard
+                    </span>
+                  </div>
+                  <h3 className="text-base sm:text-lg font-extrabold tracking-tight mt-0.5">
+                    นโยบายคุ้มครองข้อมูลส่วนบุคคล (PDPA) และสิทธิ์การใช้งาน (RBAC)
+                  </h3>
+                </div>
+              </div>
+              <button onClick={onClose} className="p-2 text-white/80 hover:text-white bg-white/10 hover:bg-white/20 rounded-xl transition">
+                <Icon name="X" size={18} />
+              </button>
+            </div>
+
+            {/* Tab Selector */}
+            <div className="px-6 pt-3 pb-2 bg-slate-50 border-b border-slate-200 flex gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setActiveTab('pdpa')}
+                className={`flex-1 py-2.5 px-3 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition ${
+                  activeTab === 'pdpa'
+                    ? 'bg-emerald-600 text-white shadow-sm'
+                    : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200/80'
+                }`}
+              >
+                <Icon name="Shield" size={16} />
+                <span>1. นโยบายคุ้มครองข้อมูลส่วนบุคคล (PDPA)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('rbac')}
+                className={`flex-1 py-2.5 px-3 rounded-xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition ${
+                  activeTab === 'rbac'
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200/80'
+                }`}
+              >
+                <Icon name="Lock" size={16} />
+                <span>2. การควบคุมสิทธิ์ตามบทบาท (RBAC)</span>
+              </button>
+            </div>
+
+            {/* Scrollable Body */}
+            <div className="p-6 overflow-y-auto custom-scroll space-y-5 text-slate-700 text-xs sm:text-sm leading-relaxed flex-1">
+              {activeTab === 'pdpa' ? (
+                <>
+                  <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-200/80 flex items-start gap-3">
+                    <div className="p-2 rounded-xl bg-emerald-600 text-white shrink-0 mt-0.5">
+                      <Icon name="Shield" size={18} />
+                    </div>
+                    <div>
+                      <h4 className="font-extrabold text-emerald-950 text-sm">
+                        ประกาศสำคัญ: เว็บไซต์นี้มีการคุ้มครองข้อมูลส่วนบุคคล (PDPA)
+                      </h4>
+                      <p className="text-emerald-800 text-xs mt-1 leading-relaxed">
+                        ระบบจัดการเรียนการสอน <b>EduPortal LMS</b> ปฏิบัติตามพระราชบัญญัติคุ้มครองข้อมูลส่วนบุคคล พ.ศ. 2562 (Personal Data Protection Act: PDPA) เพื่อคุ้มครองข้อมูลของนักเรียน ครูผู้สอน และบุคลากรทางการศึกษาอย่างเคร่งครัด
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                    <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-1.5">
+                      <div className="font-extrabold text-slate-900 flex items-center gap-2">
+                        <Icon name="FileText" size={16} className="text-indigo-600" />
+                        <span>1. ข้อมูลส่วนบุคคลที่ระบบจัดเก็บ</span>
+                      </div>
+                      <ul className="list-disc list-inside text-xs text-slate-600 space-y-1">
+                        <li><b>ข้อมูลนักเรียน:</b> รหัสนักเรียน, ชื่อ-นามสกุล, ระดับชั้น/ห้องเรียน, รายวิชาที่ลงทะเบียนเรียน</li>
+                        <li><b>ข้อมูลครูผู้สอน:</b> ชื่อ-นามสกุล, อีเมลโรงเรียน, กลุ่มสาระการเรียนรู้</li>
+                        <li><b>ข้อมูลการเรียน:</b> ไฟล์งาน/การบ้านที่ส่ง (จัดเก็บบน Google Drive), คะแนนสอบ และผลการประเมิน</li>
+                      </ul>
+                    </div>
+
+                    <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-1.5">
+                      <div className="font-extrabold text-slate-900 flex items-center gap-2">
+                        <Icon name="CheckCircle2" size={16} className="text-emerald-600" />
+                        <span>2. วัตถุประสงค์ในการประมวลผลข้อมูล</span>
+                      </div>
+                      <ul className="list-disc list-inside text-xs text-slate-600 space-y-1">
+                        <li>ใช้เพื่อการจัดการเรียนการสอนออนไลน์ การส่งการบ้าน และการวัดผลประเมินผลในโรงเรียนเท่านั้น</li>
+                        <li>ใช้ตรวจสอบสิทธิ์การเข้าเรียนรายวิชา (AllowedCourses) ให้ตรงตัวบุคคล</li>
+                        <li><b>ไม่นำข้อมูลไปเปิดเผย</b> หรือใช้เพื่อการพาณิชย์/การตลาดแก่บุคคลภายนอกโดยเด็ดขาด</li>
+                      </ul>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-2xl bg-indigo-50/60 border border-indigo-100 space-y-2">
+                    <div className="font-extrabold text-indigo-950 flex items-center gap-2">
+                      <Icon name="Lock" size={16} className="text-indigo-600" />
+                      <span>3. มาตรการรักษาความมั่นคงปลอดภัยของข้อมูล (Security Measures)</span>
+                    </div>
+                    <ul className="list-disc list-inside text-xs text-slate-700 space-y-1">
+                      <li><b>บังคับเปลี่ยนรหัส PIN / รหัสผ่านหลังล็อกอินครั้งแรก:</b> นักเรียนที่ล็อกอินด้วย PIN เริ่มต้น (1234) และครูที่ล็อกอินด้วยรหัสเริ่มต้น (123) ระบบจะบังคับให้ตั้งรหัสส่วนตัวใหม่ทันทีก่อนเข้าใช้งาน</li>
+                      <li><b>การแบ่งแยกสิทธิ์ตามบทบาท (RBAC):</b> นักเรียนแต่ละคนเห็นเฉพาะการบ้านและคะแนนสอบของตนเอง ไม่สามารถดูข้อมูลของนักเรียนคนอื่นได้</li>
+                      <li><b>ฐานข้อมูลปลอดภัย:</b> จัดเก็บข้อมูลบน Google Firebase Realtime Database และ Google Drive ของสถานศึกษา</li>
+                    </ul>
+                  </div>
+
+                  <div className="p-4 rounded-2xl bg-amber-50/70 border border-amber-200/80 space-y-1.5">
+                    <div className="font-extrabold text-amber-950 flex items-center gap-2">
+                      <Icon name="UserCheck" size={16} className="text-amber-600" />
+                      <span>4. สิทธิของเจ้าของข้อมูลส่วนบุคคล (Data Subject Rights)</span>
+                    </div>
+                    <p className="text-xs text-amber-900">
+                      นักเรียน ผู้ปกครอง และครูผู้สอน มีสิทธิในการขอเข้าถึง ตรวจสอบ แก้ไขข้อมูลให้ถูกต้อง หรือขอให้ลบ/ระงับการใช้ข้อมูลส่วนบุคคลเมื่อสำเร็จการศึกษาหรือพ้นสภาพ โดยติดต่อผ่านครูประจำวิชาหรือผู้ดูแลระบบของโรงเรียน
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="p-4 rounded-2xl bg-indigo-50 border border-indigo-200/80 flex items-start gap-3">
+                    <div className="p-2 rounded-xl bg-indigo-600 text-white shrink-0 mt-0.5">
+                      <Icon name="Lock" size={18} />
+                    </div>
+                    <div>
+                      <h4 className="font-extrabold text-indigo-950 text-sm">
+                        Role-Based Access Control (RBAC) คืออะไร?
+                      </h4>
+                      <p className="text-indigo-800 text-xs mt-1 leading-relaxed">
+                        <b>RBAC (การควบคุมการเข้าถึงตามบทบาทหน้าที่)</b> คือมาตรฐานความปลอดภัยที่จำกัดสิทธิ์การมองเห็นและการแก้ไขข้อมูลให้ตรงตามบทบาทของผู้ใช้งาน (หลักการ <i>Least Privilege</i> — ให้สิทธิ์เท่าที่จำเป็นต่อหน้าที่) เพื่อป้องกันการรั่วไหลของข้อมูลส่วนบุคคลตามมาตรฐาน PDPA
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-3">
+                    {/* Student Role */}
+                    <div className="p-4 rounded-2xl border border-emerald-200 bg-emerald-50/40">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="px-3 py-1 rounded-full bg-emerald-100 text-emerald-800 font-extrabold text-xs flex items-center gap-1.5">
+                          <Icon name="Users" size={14} />
+                          <span>บทบาทที่ 1: นักเรียน (Student Role)</span>
+                        </span>
+                        <span className="text-[11px] font-mono text-emerald-700 font-bold">สิทธิ์ระดับผู้เรียนเฉพาะบุคคล</span>
+                      </div>
+                      <ul className="list-disc list-inside text-xs text-slate-700 space-y-1">
+                        <li><b>การเข้าถึงรายวิชา:</b> เห็นเฉพาะรายวิชาของระดับชั้นตนเอง หรือวิชาที่ครูลงทะเบียนเพิ่มสิทธิ์ (<code className="bg-white px-1.5 py-0.5 rounded border">AllowedCourses</code>) ให้เท่านั้น</li>
+                        <li><b>การส่งงานและผลคะแนน:</b> ส่งการบ้าน ทำข้อสอบ และดูคะแนนได้เฉพาะของรหัสนักเรียนตนเอง <b>ไม่สามารถ</b>ดูไฟล์งานหรือคะแนนของเพื่อนคนอื่นได้</li>
+                        <li><b>ความปลอดภัย:</b> บังคับเปลี่ยนรหัส PIN ทันทีเมื่อล็อกอินครั้งแรก และสามารถเปลี่ยน PIN เองได้ตลอดเวลา</li>
+                      </ul>
+                    </div>
+
+                    {/* Teacher Role */}
+                    <div className="p-4 rounded-2xl border border-amber-200 bg-amber-50/40">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="px-3 py-1 rounded-full bg-amber-100 text-amber-800 font-extrabold text-xs flex items-center gap-1.5">
+                          <Icon name="UserCheck" size={14} />
+                          <span>บทบาทที่ 2: ครูผู้สอน (Teacher Role)</span>
+                        </span>
+                        <span className="text-[11px] font-mono text-amber-800 font-bold">สิทธิ์ระดับผู้จัดการรายวิชา</span>
+                      </div>
+                      <ul className="list-disc list-inside text-xs text-slate-700 space-y-1">
+                        <li><b>การจัดการเรียนการสอน:</b> สร้าง/แก้ไขรายวิชา บทเรียน การบ้าน และข้อสอบในรายวิชาที่รับผิดชอบ</li>
+                        <li><b>การจัดการทะเบียนผู้เรียน:</b> ดู <code className="bg-white px-1.5 py-0.5 rounded border">CourseID</code> ของตนเอง, เลือกเพิ่มนักเรียนเข้าเรียน หรือถอนนักเรียนออกจากวิชาของตนได้</li>
+                        <li><b>การตรวจงานและดูแลผู้เรียน:</b> ตรวจไฟล์การบ้าน ให้คะแนน ดูสถิติผลสอบ และรีเซ็ต PIN ให้นักเรียนที่ลืมรหัสได้ (เมื่อรีเซ็ตเป็น 1234 ระบบจะบังคับให้นักเรียนตั้งรหัสใหม่เมื่อล็อกอิน)</li>
+                        <li><b>ข้อจำกัดสิทธิ์ตาม RBAC:</b> ไม่สามารถลบฐานข้อมูลหลักของโรงเรียน หรือแก้ไขบัญชีของครูท่านอื่นได้</li>
+                      </ul>
+                    </div>
+
+                    {/* Admin Role */}
+                    <div className="p-4 rounded-2xl border border-rose-200 bg-rose-50/40">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="px-3 py-1 rounded-full bg-rose-100 text-rose-800 font-extrabold text-xs flex items-center gap-1.5">
+                          <Icon name="Shield" size={14} />
+                          <span>บทบาทที่ 3: ผู้ดูแลระบบ (Administrator Role)</span>
+                        </span>
+                        <span className="text-[11px] font-mono text-rose-800 font-bold">สิทธิ์ระดับผู้ควบคุมระบบกลาง</span>
+                      </div>
+                      <ul className="list-disc list-inside text-xs text-slate-700 space-y-1">
+                        <li><b>การบริหารจัดการผู้ใช้:</b> จัดการข้อมูลครูผู้สอน นักเรียนทั้งหมด และการนำเข้าข้อมูล (CSV Batch Import)</li>
+                        <li><b>การดูแลฐานข้อมูลและความปลอดภัย:</b> ตั้งค่าการเชื่อมต่อ Firebase Realtime Database, Google Apps Script / Google Drive และกำกับดูแลการคุ้มครองข้อมูลส่วนบุคคล (PDPA) ทั้งระบบ</li>
+                      </ul>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="px-6 py-4 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
+              <div className="text-[11px] text-slate-500 flex items-center gap-1.5">
+                <Icon name="CheckCircle2" size={14} className="text-emerald-600 shrink-0" />
+                <span>มาตรฐานความปลอดภัยข้อมูลส่วนบุคคล PDPA & RBAC • EduPortal LMS</span>
+              </div>
+              <div className="flex items-center gap-2 w-full sm:w-auto">
+                {onAcceptConsent ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={onClose}
+                      className="flex-1 sm:flex-initial px-4 py-2.5 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs rounded-xl transition"
+                    >
+                      ปิดหน้าต่าง
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onAcceptConsent}
+                      className="flex-1 sm:flex-initial px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs rounded-xl shadow-md shadow-emerald-600/20 flex items-center justify-center gap-1.5 transition active:scale-95"
+                    >
+                      <Icon name="Check" size={15} />
+                      <span>รับทราบและทำเครื่องหมายยินยอม PDPA</span>
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className="w-full sm:w-auto px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs rounded-xl shadow-md transition active:scale-95"
+                  >
+                    รับทราบและปิดหน้าต่าง
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // --- Force First-Login PIN / Password Change Screen (with RBAC Explanation) ---
+    function ForceChangePinScreen({ currentUser, liveUser, isVoluntary = false, onSaveNewCredential, onOpenPdpaPolicy, onClose, onLogout }) {
+      const isStudent = currentUser?.role === 'student';
+      const isTeacher = currentUser?.role === 'teacher';
+      const [newSecret, setNewSecret] = useState('');
+      const [confirmSecret, setConfirmSecret] = useState('');
+      const [showSecret, setShowSecret] = useState(false);
+      const [isSubmitting, setIsSubmitting] = useState(false);
+
+      const currentSecretValue = isStudent
+        ? String(liveUser?.PIN || currentUser?.user?.PIN || '1234').trim()
+        : String(liveUser?.Password || currentUser?.user?.Password || '123').trim();
+
+      const handleSubmit = async (e) => {
+        e.preventDefault();
+        const cleanNew = newSecret.trim();
+        const cleanConfirm = confirmSecret.trim();
+
+        if (cleanNew.length < 4) {
+          Swal.fire({
+            icon: 'warning',
+            title: isStudent ? 'รหัส PIN ต้องมีอย่างน้อย 4 หลัก' : 'รหัสผ่านต้องมีอย่างน้อย 4 ตัวอักษร',
+            text: 'กรุณาตั้งรหัสใหม่ที่มีความยาวอย่างน้อย 4 ตัวอักษรขึ้นไปเพื่อความปลอดภัย',
+            confirmButtonColor: '#4f46e5'
+          });
+          return;
+        }
+
+        if (cleanNew === '1234' || cleanNew === '123' || cleanNew === '0000') {
+          Swal.fire({
+            icon: 'error',
+            title: 'ห้ามใช้รหัสผ่านเริ่มต้นที่คาดเดาง่าย',
+            text: 'เพื่อคุ้มครองข้อมูลส่วนบุคคลตามมาตรฐาน PDPA กรุณาตั้งรหัสใหม่ที่ไม่ใช่ 1234, 123 หรือ 0000',
+            confirmButtonColor: '#ef4444'
+          });
+          return;
+        }
+
+        if (!isVoluntary && cleanNew === currentSecretValue) {
+          Swal.fire({
+            icon: 'warning',
+            title: 'รหัสใหม่ต้องไม่ซ้ำกับรหัสเริ่มต้น',
+            text: 'กรุณาตั้งรหัสผ่าน/PIN ใหม่ที่แตกต่างจากรหัสเดิม',
+            confirmButtonColor: '#f59e0b'
+          });
+          return;
+        }
+
+        if (cleanNew !== cleanConfirm) {
+          Swal.fire({
+            icon: 'error',
+            title: 'รหัสยืนยันไม่ตรงกัน',
+            text: 'กรุณากรอกรหัสใหม่และยืนยันรหัสใหม่ให้ตรงกันทั้ง 2 ช่อง',
+            confirmButtonColor: '#ef4444'
+          });
+          return;
+        }
+
+        try {
+          setIsSubmitting(true);
+          await onSaveNewCredential(cleanNew);
+          await Swal.fire({
+            icon: 'success',
+            title: isStudent ? 'เปลี่ยนรหัส PIN สำเร็จ!' : 'เปลี่ยนรหัสผ่านครูผู้สอนสำเร็จ!',
+            text: 'ระบบได้บันทึกรหัสส่วนตัวใหม่ของคุณเข้าสู่ฐานข้อมูลเรียบร้อยแล้ว',
+            timer: 1800,
+            showConfirmButton: false
+          });
+        } finally {
+          setIsSubmitting(false);
+        }
+      };
+
+      const cardContent = (
+        <div className="w-full max-w-2xl bg-white rounded-3xl shadow-2xl border border-slate-100 overflow-hidden my-auto">
+          {/* Header Banner */}
+          <div className={`px-6 py-5 text-white ${
+            isStudent
+              ? 'bg-gradient-to-r from-indigo-600 via-indigo-700 to-brand-600'
+              : 'bg-gradient-to-r from-amber-600 via-orange-600 to-indigo-800'
+          }`}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3.5">
+                <div className="w-12 h-12 rounded-2xl bg-white/15 backdrop-blur flex items-center justify-center border border-white/25 shrink-0">
+                  <Icon name="Key" size={24} />
+                </div>
+                <div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="px-2.5 py-0.5 rounded-full bg-white/20 text-[10px] font-extrabold uppercase tracking-wider">
+                      {isVoluntary ? 'Security Update' : 'First-Login Security Enforcement'}
+                    </span>
+                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-400/25 border border-emerald-300/40 text-emerald-100 text-[10px] font-extrabold">
+                      PDPA & RBAC Protection
+                    </span>
+                  </div>
+                  <h2 className="text-lg sm:text-xl font-extrabold mt-1">
+                    {isVoluntary
+                      ? (isStudent ? 'เปลี่ยนรหัส PIN นักเรียน' : 'เปลี่ยนรหัสผ่าน/PIN ครูผู้สอน')
+                      : (isStudent
+                          ? 'บังคับเปลี่ยนรหัส PIN นักเรียน (เข้าสู่ระบบครั้งแรก)'
+                          : 'บังคับเปลี่ยนรหัสผ่าน/PIN ครูผู้สอน (เข้าสู่ระบบครั้งแรก)')}
+                  </h2>
+                </div>
+              </div>
+              {isVoluntary && onClose && (
+                <button onClick={onClose} className="p-2 rounded-xl bg-white/10 hover:bg-white/20 text-white transition">
+                  <Icon name="X" size={18} />
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="p-6 sm:p-7 space-y-5 max-h-[82vh] overflow-y-auto custom-scroll">
+            {/* User Info Strip */}
+            <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-3">
+                <div className={`w-10 h-10 rounded-xl font-black text-white flex items-center justify-center ${
+                  isStudent ? 'bg-indigo-600' : 'bg-amber-600'
+                }`}>
+                  {(currentUser?.user?.Name || 'U').charAt(0)}
+                </div>
+                <div>
+                  <div className="text-sm font-extrabold text-slate-900">{currentUser?.user?.Name}</div>
+                  <div className="text-xs text-slate-500">
+                    {isStudent
+                      ? `รหัสนักเรียน: ${currentUser?.user?.StudentID} • ชั้น ${currentUser?.user?.Grade || '-'}`
+                      : `อีเมล: ${currentUser?.user?.Email} • กลุ่มสาระ: ${currentUser?.user?.Department || '-'}`}
+                  </div>
+                </div>
+              </div>
+              <span className={`px-3 py-1 rounded-full text-xs font-extrabold ${
+                isStudent ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
+              }`}>
+                {isStudent ? 'บทบาท: นักเรียน (Student)' : 'บทบาท: ครูผู้สอน (Teacher)'}
+              </span>
+            </div>
+
+            {/* Why Force PIN Change + Role-Based Access Control (RBAC) Explanation */}
+            <div className="p-4 rounded-2xl bg-indigo-50/70 border border-indigo-200/80 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-extrabold text-indigo-950 text-xs sm:text-sm flex items-center gap-2">
+                  <Icon name="Shield" size={17} className="text-indigo-600 shrink-0" />
+                  <span>คำอธิบายสิทธิ์การใช้งานตามบทบาท (Role-Based Access Control - RBAC) & PDPA</span>
+                </div>
+                {onOpenPdpaPolicy && (
+                  <button
+                    type="button"
+                    onClick={onOpenPdpaPolicy}
+                    className="text-[11px] font-extrabold text-indigo-600 hover:text-indigo-800 underline shrink-0"
+                  >
+                    อ่านนโยบายฉบับเต็ม
+                  </button>
+                )}
+              </div>
+
+              {isStudent ? (
+                <div className="text-xs text-slate-700 space-y-1.5 leading-relaxed">
+                  <p>
+                    เพื่อคุ้มครองข้อมูลส่วนบุคคลของนักเรียนตาม <b>พ.ร.บ. คุ้มครองข้อมูลส่วนบุคคล (PDPA)</b> ระบบจึงบังคับให้นักเรียนเปลี่ยนรหัส PIN เริ่มต้น (<code className="bg-white px-1.5 py-0.5 rounded border font-mono">1234</code>) เป็นรหัสส่วนตัวก่อนเข้าสู่บทเรียน
+                  </p>
+                  <div className="p-3 rounded-xl bg-white border border-indigo-100 space-y-1">
+                    <div className="font-extrabold text-indigo-900 text-xs">🛡️ สิทธิ์ของนักเรียนภายใต้ระบบ RBAC:</div>
+                    <ul className="list-disc list-inside text-[11px] text-slate-600 space-y-0.5">
+                      <li>เข้าเรียนได้เฉพาะรายวิชาของชั้นตนเอง หรือวิชาที่ครูลงทะเบียนเพิ่มสิทธิ์ (<code className="font-mono">AllowedCourses</code>) ให้</li>
+                      <li>ส่งการบ้าน ทำแบบทดสอบ และดูผลคะแนนได้เฉพาะของตนเอง (เพื่อนคนอื่นไม่สามารถเข้าดูคะแนนหรือไฟล์งานของคุณได้)</li>
+                    </ul>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-xs text-slate-700 space-y-2 leading-relaxed">
+                  <p>
+                    เนื่องจากบัญชีครูผู้สอนมีสิทธิ์เข้าถึงข้อมูลส่วนบุคคลและผลการเรียนของนักเรียน ระบบจึงบังคับให้ครูเปลี่ยนรหัสผ่าน/PIN เริ่มต้น (<code className="bg-white px-1.5 py-0.5 rounded border font-mono">123</code>) เป็นรหัสส่วนตัวทันทีเพื่อปฏิบัติตามมาตรฐาน <b>PDPA</b> และ <b>RBAC (Role-Based Access Control)</b>
+                  </p>
+                  <div className="p-3.5 rounded-xl bg-white border border-amber-200/80 space-y-1.5">
+                    <div className="font-extrabold text-amber-900 text-xs flex items-center gap-1.5">
+                      <Icon name="Lock" size={14} className="text-amber-600" />
+                      <span>ขอบเขตสิทธิ์และหน้าที่ของครูผู้สอน (Teacher RBAC Permissions):</span>
+                    </div>
+                    <ul className="list-disc list-inside text-[11px] text-slate-600 space-y-1">
+                      <li><b>สิทธิ์จัดการรายวิชา (Course Management):</b> สร้าง/แก้ไขรายวิชา บทเรียน การบ้าน ข้อสอบ และดูรหัสวิชา (<code className="font-mono">CourseID</code>) ของตนเอง</li>
+                      <li><b>สิทธิ์จัดการผู้เรียนในวิชา (Enrollment Control):</b> เลือกเพิ่มนักเรียนเข้าเรียน หรือถอนนักเรียนออกจากรายวิชาที่ครูเปิดสอน (<code className="font-mono">AllowedCourses</code>)</li>
+                      <li><b>สิทธิ์เข้าถึงข้อมูลนักเรียน (Data Access & Grading):</b> ตรวจไฟล์ส่งงาน ให้คะแนน ดูสถิติผลสอบ และรีเซ็ต PIN ให้นักเรียนที่ลืมรหัสภายใต้กรอบ PDPA</li>
+                      <li><b>การจำกัดสิทธิ์ตามบทบาท (Role Isolation):</b> บัญชีครูถูกแยกสิทธิ์ออกจากแอดมินกลาง เพื่อป้องกันการแก้ไขโครงสร้างฐานข้อมูลหรือบัญชีของครูท่านอื่นโดยไม่ตั้งใจ</li>
+                    </ul>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Form to set new PIN / Password */}
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-extrabold text-slate-700 mb-1.5">
+                    {isStudent ? 'ตั้งรหัส PIN ใหม่ (4-10 หลัก)' : 'ตั้งรหัสผ่าน / PIN ใหม่ (อย่างน้อย 4 ตัวอักษร)'}
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showSecret ? "text" : "password"}
+                      inputMode={isStudent ? "numeric" : "text"}
+                      required
+                      minLength={4}
+                      maxLength={isStudent ? 10 : 30}
+                      value={newSecret}
+                      onChange={(e) => setNewSecret(e.target.value)}
+                      placeholder={isStudent ? "เช่น 2554 หรือ 8912 (ห้ามใช้ 1234)" : "ตั้งรหัสผ่านส่วนตัวใหม่ (ห้ามใช้ 123)"}
+                      className="w-full pl-4 pr-10 py-3 bg-slate-50 border border-slate-300 rounded-2xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-600 font-mono tracking-wider"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowSecret(!showSecret)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                    >
+                      <Icon name={showSecret ? "EyeOff" : "Eye"} size={18} />
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-extrabold text-slate-700 mb-1.5">
+                    ยืนยันรหัสใหม่อีกครั้ง (Confirm)
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showSecret ? "text" : "password"}
+                      inputMode={isStudent ? "numeric" : "text"}
+                      required
+                      minLength={4}
+                      maxLength={isStudent ? 10 : 30}
+                      value={confirmSecret}
+                      onChange={(e) => setConfirmSecret(e.target.value)}
+                      placeholder="กรอกรหัสใหม่อีกครั้งให้ตรงกัน"
+                      className="w-full pl-4 pr-10 py-3 bg-slate-50 border border-slate-300 rounded-2xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-600 font-mono tracking-wider"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">
+                {isVoluntary ? (
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className="w-full sm:w-auto px-5 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-2xl transition"
+                  >
+                    ยกเลิก
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={onLogout}
+                    className="w-full sm:w-auto px-4 py-2.5 bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold text-xs rounded-xl border border-rose-200/80 flex items-center justify-center gap-1.5 transition"
+                  >
+                    <Icon name="LogOut" size={15} />
+                    <span>ออกจากระบบ</span>
+                  </button>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="w-full sm:w-auto px-7 py-3.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 disabled:opacity-50 text-white font-extrabold text-sm rounded-2xl shadow-lg shadow-emerald-600/25 flex items-center justify-center gap-2 transition active:scale-95"
+                >
+                  <Icon name="CheckCircle2" size={18} />
+                  <span>{isSubmitting ? 'กำลังบันทึกรหัสใหม่...' : 'บันทึกรหัสใหม่และเข้าใช้งานระบบ'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      );
+
+      if (isVoluntary) {
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-sm animate-fade-in" onClick={onClose}>
+            <div onClick={e => e.stopPropagation()} className="w-full max-w-2xl flex justify-center">
+              {cardContent}
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-indigo-950 via-slate-900 to-slate-950 flex flex-col items-center justify-center p-4">
+          {cardContent}
         </div>
       );
     }
